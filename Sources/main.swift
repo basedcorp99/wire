@@ -64,6 +64,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var codexClient: CodexAPIClient!
     private var recorder: AudioRecorder!
     private var statusSpinnerTimer: Timer?
+    private var recordingStatusTimer: Timer?
+    private var recordingStartedAt: Date?
     private var statusSpinnerIndex = 0
     private var activeRecordingKind: HotKeyKind?
     private let statusSpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -166,6 +168,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if isTranscribing {
                 self.startStatusSpinner()
+            } else if self.recorder.isRecording {
+                self.stopStatusSpinner()
+                self.updateRecordingStatusTitle()
             } else {
                 self.stopStatusSpinner()
                 self.statusItem.button?.title = ""
@@ -187,6 +192,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusSpinnerTimer?.invalidate()
         statusSpinnerTimer = nil
         statusSpinnerIndex = 0
+    }
+
+    private func startRecordingStatusTimer() {
+        recordingStartedAt = Date()
+        updateRecordingStatusTitle()
+        recordingStatusTimer?.invalidate()
+        recordingStatusTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.updateRecordingStatusTitle()
+        }
+    }
+
+    private func stopRecordingStatusTimer() {
+        recordingStatusTimer?.invalidate()
+        recordingStatusTimer = nil
+        recordingStartedAt = nil
+    }
+
+    private func updateRecordingStatusTitle() {
+        guard let recordingStartedAt else {
+            statusItem.button?.title = ""
+            return
+        }
+
+        let elapsedSeconds = max(0, Int(Date().timeIntervalSince(recordingStartedAt)))
+        let minutes = elapsedSeconds / 60
+        let seconds = elapsedSeconds % 60
+        statusItem.button?.title = String(format: " REC %d:%02d", minutes, seconds)
     }
 
     private func handleToggleHotKeyPressed() {
@@ -231,6 +263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 try recorder.start()
                 activeRecordingKind = kind
+                startRecordingStatusTimer()
             } catch {
                 state.statusText = "Could not start recording: \(error.localizedDescription)"
                 state.transcriptionStage = .error(error.localizedDescription)
@@ -246,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.transcriptionStage = .transcribing
 
             let audioData = recorder.stop()
+            stopRecordingStatusTimer()
             activeRecordingKind = nil
 
             guard let data = audioData, data.count > 1000 else {
@@ -480,7 +514,6 @@ final class AudioRecorder {
     private var engine: AVAudioEngine?
     private var outputFile: AVAudioFile?
     private var tempURL: URL?
-    private var timer: Timer?
 
     var isRecording: Bool { engine?.isRunning ?? false }
 
@@ -511,19 +544,12 @@ final class AudioRecorder {
 
         engine.prepare()
         try engine.start()
-
-        // Auto-stop after 30 seconds max
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: false) { [weak self] _ in
-            _ = self?.stopAndTranscribe()
-        }
     }
 
     /// Stop recording and return the audio data
     private func stopAndTranscribe() -> Data? {
         guard let engine = engine, let url = tempURL else { return nil }
 
-        timer?.invalidate()
-        timer = nil
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         self.engine = nil
@@ -722,7 +748,7 @@ final class CodexAPIClient: NSObject, WKNavigationDelegate, WKScriptMessageHandl
         formData.append('file', blob, 'recording.wav');
 
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 45000);
+        const timeout = setTimeout(() => controller.abort(), 80000);
         try {
             const response = await fetch('https://chatgpt.com/backend-api/transcribe', {
                 method: 'POST',
@@ -767,7 +793,7 @@ final class CodexAPIClient: NSObject, WKNavigationDelegate, WKScriptMessageHandl
                 }
             }
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 55) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 110) {
                 finish(.failure(AppError.transcriptionFailed("Timed out waiting for ChatGPT transcription response")))
             }
 

@@ -42,6 +42,7 @@ and opens it. If `/Applications` requires admin rights, the script will ask via 
 - Two shortcuts are available:
   - **Hold shortcut**: hold to record, release to stop and transcribe. Default: `⌃⌥M`.
   - **Toggle shortcut**: press once to start, again to stop and transcribe. Default: `⌘⇧M`.
+- Toggle recordings do not have a fixed local time cap. While recording, the menu bar item shows `REC` with the elapsed duration so you can spot an accidentally active recording.
 - Click either shortcut button to reset it. While recording a new shortcut, the button shows `Listening…`, then updates live as you press modifiers/keys (for example `⌘⇧M`). It saves when all keys are released; press `Esc` to cancel.
 - The latest transcript appears in the popover, with a copy button beside it.
 - Transcripts are always copied to the clipboard. If Accessibility permission is granted, `wire` also pastes the transcript into the active app.
