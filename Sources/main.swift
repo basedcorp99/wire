@@ -79,6 +79,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recorder: AudioRecorder!
     private var statusSpinnerTimer: Timer?
     private var recordingStatusTimer: Timer?
+    private var menuBarFeedbackClearWorkItem: DispatchWorkItem?
+    private var menuBarFeedbackTitle: String?
     private var popoverOutsideClickMonitors: [Any] = []
     private var recordingStartedAt: Date?
     private var activeRecordingShouldPressReturn = false
@@ -300,6 +302,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else if self.recorder.hasActiveRecording {
                 self.stopStatusSpinner()
                 self.updateRecordingStatusTitle()
+            } else if let menuBarFeedbackTitle = self.menuBarFeedbackTitle {
+                self.stopStatusSpinner()
+                self.statusItem.button?.title = " " + menuBarFeedbackTitle
             } else {
                 self.stopStatusSpinner()
                 self.statusItem.button?.title = ""
@@ -336,6 +341,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordingStatusTimer?.invalidate()
         recordingStatusTimer = nil
         recordingStartedAt = nil
+    }
+
+    private func showMenuBarFeedback(_ title: String, duration: TimeInterval = 1.4) {
+        menuBarFeedbackClearWorkItem?.cancel()
+        menuBarFeedbackTitle = title
+        renderStatusItem()
+
+        let clearWorkItem = DispatchWorkItem { [weak self] in
+            guard let self, self.menuBarFeedbackTitle == title else { return }
+            self.menuBarFeedbackTitle = nil
+            self.renderStatusItem()
+        }
+        menuBarFeedbackClearWorkItem = clearWorkItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: clearWorkItem)
     }
 
     private func updateRecordingStatusTitle() {
@@ -714,7 +733,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   normalizedPhrase(phrase).split(separator: " ").count >= 2,
                   fuzzyMatches(text, phrase) else { return false }
             setComputerControlsEnabled(true)
-            state.statusText = "Computer controls enabled"
+            state.statusText = "Computer mode enabled"
+            showMenuBarFeedback("Mode on")
             return true
         }
 
@@ -874,7 +894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func setComputerControlsEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: Self.computerControlsEnabledDefaultsKey)
         state.computerControlsEnabled = enabled
-        state.statusText = enabled ? "Computer controls enabled" : "Computer controls disabled"
+        state.statusText = enabled ? "Computer mode enabled" : "Computer mode disabled"
     }
 
     func setComputerAutoEnableEnabled(_ enabled: Bool) {
@@ -2162,7 +2182,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
     private let loadingIndicator = NSProgressIndicator()
     private var headsetSettingsRows: [NSView] = []
-    private var computerSettingsRows: [NSView] = []
+    private var computerModeRows: [NSView] = []
     private var computerAutoEnableRows: [NSView] = []
     private var computerHarnessRows: [NSView] = []
     private var headsetCollapsedSpacer: NSView?
@@ -2175,6 +2195,8 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private var shortcutCaptureModifiers: UInt32 = 0
     private var shortcutCaptureCurrentModifiers: UInt32 = 0
     private var shortcutCapturePressedKeyCodes = Set<UInt16>()
+    private var computerAutoEnableSaveWorkItem: DispatchWorkItem?
+    private var computerHarnessSaveWorkItem: DispatchWorkItem?
 
     init(state: AppState, hotKeyManager: HotKeyManager, headsetProbeManager: HeadsetProbeManager) {
         self.state = state
@@ -2338,13 +2360,13 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         computerInfoButton.imagePosition = .imageOnly
         computerInfoButton.target = self
         computerInfoButton.action = #selector(showComputerInfo)
-        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Computer controls details") {
+        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Computer mode details") {
             infoImage.isTemplate = true
             computerInfoButton.image = infoImage
         }
         computerInfoButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
         computerInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
-        rootStack.addArrangedSubview(menuRow(symbol: "desktopcomputer", title: "Computer controls (dangerous)", trailing: trailingGroup([computerInfoButton, computerControlsSwitch])))
+        rootStack.addArrangedSubview(menuRow(symbol: "desktopcomputer", title: "Computer mode (dangerous)", trailing: trailingGroup([computerInfoButton, computerControlsSwitch])))
 
         configureSwitch(computerCustomHarnessSwitch, action: #selector(toggleComputerCustomHarness))
         computerHarnessInfoButton.bezelStyle = .inline
@@ -2388,11 +2410,12 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         computerAutoEnableField.action = #selector(updateComputerAutoEnablePhrase)
         computerAutoEnableField.widthAnchor.constraint(equalToConstant: 142).isActive = true
         computerAutoEnableField.heightAnchor.constraint(equalToConstant: 26).isActive = true
+
         let phraseRow = menuRow(symbol: "text.cursor", title: "Phrase", trailing: computerAutoEnableField)
         rootStack.addArrangedSubview(phraseRow)
         let computerBottomSpacer = spacer(height: 9)
         rootStack.addArrangedSubview(computerBottomSpacer)
-        computerSettingsRows = [customHarnessToggleRow, autoEnableToggleRow, computerBottomSpacer]
+        computerModeRows = [customHarnessToggleRow]
         computerHarnessRows = [commandRow]
         computerAutoEnableRows = [phraseRow]
 
@@ -2530,7 +2553,14 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         guard isViewLoaded else { return }
         let apply = { [weak self] in
             guard let self else { return }
-            self.statusLabel.stringValue = self.state.statusText.isEmpty ? "Ready" : self.state.statusText
+            let autoEnablePhrase = self.computerAutoEnableField.currentEditor() == nil
+                ? self.state.computerAutoEnablePhrase
+                : self.computerAutoEnableField.stringValue
+            let hasInvalidAutoEnablePhrase = self.state.computerAutoEnableEnabled && self.autoEnablePhraseWordCount(autoEnablePhrase) < 2
+            self.statusLabel.stringValue = hasInvalidAutoEnablePhrase
+                ? "Minimum 2 words"
+                : (self.state.statusText.isEmpty ? "Ready" : self.state.statusText)
+            self.statusLabel.textColor = hasInvalidAutoEnablePhrase ? .systemRed : .secondaryLabelColor
             if self.shortcutCaptureTarget == nil {
                 self.holdShortcutButton.title = self.hotKeyManager.holdShortcutDisplay
                 self.toggleShortcutButton.title = self.hotKeyManager.toggleShortcutDisplay
@@ -2576,10 +2606,10 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             self.sendEnterAfterPasteSwitch.isEnabled = self.state.headsetControlsEnabled
             self.headsetSettingsRows.forEach { $0.isHidden = !self.state.headsetControlsEnabled }
             self.headsetCollapsedSpacer?.isHidden = self.state.headsetControlsEnabled
-            self.computerSettingsRows.forEach { $0.isHidden = !self.state.computerControlsEnabled }
+            self.computerModeRows.forEach { $0.isHidden = !self.state.computerControlsEnabled }
             let showComputerCommand = self.state.computerControlsEnabled && self.state.computerCustomHarnessEnabled
             self.computerHarnessRows.forEach { $0.isHidden = !showComputerCommand }
-            let showComputerPhrase = self.state.computerControlsEnabled && self.state.computerAutoEnableEnabled
+            let showComputerPhrase = self.state.computerAutoEnableEnabled
             self.computerAutoEnableRows.forEach { $0.isHidden = !showComputerPhrase }
 
             if self.state.computerCommandRunning {
@@ -2608,6 +2638,15 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
 
         let height = ceil(rootStack.fittingSize.height)
         preferredContentSize = NSSize(width: Layout.width, height: height)
+    }
+
+    private func autoEnablePhraseWordCount(_ phrase: String) -> Int {
+        phrase
+            .unicodeScalars
+            .map { CharacterSet.alphanumerics.contains($0) ? Character($0) : " " }
+            .reduce(into: "") { $0.append($1) }
+            .split(separator: " ")
+            .count
     }
 
     @objc private func trigger() {
@@ -2700,12 +2739,14 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     }
 
     @objc private func updateComputerAutoEnablePhrase() {
+        computerAutoEnableSaveWorkItem?.cancel()
         (NSApp.delegate as? AppDelegate)?.setComputerAutoEnablePhrase(computerAutoEnableField.stringValue)
         view.window?.makeFirstResponder(nil)
         refresh()
     }
 
     @objc private func updateComputerHarnessCommand() {
+        computerHarnessSaveWorkItem?.cancel()
         (NSApp.delegate as? AppDelegate)?.setComputerHarnessCommand(computerHarnessField.stringValue)
         view.window?.makeFirstResponder(nil)
         refresh()
@@ -2719,13 +2760,43 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         }
     }
 
+    func controlTextDidChange(_ obj: Notification) {
+        if obj.object as? NSTextField === computerAutoEnableField {
+            scheduleComputerAutoEnablePhraseSave()
+            refresh()
+        } else if obj.object as? NSTextField === computerHarnessField {
+            scheduleComputerHarnessCommandSave()
+            refresh()
+        }
+    }
+
+    private func scheduleComputerAutoEnablePhraseSave() {
+        computerAutoEnableSaveWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            (NSApp.delegate as? AppDelegate)?.setComputerAutoEnablePhrase(self.computerAutoEnableField.stringValue)
+        }
+        computerAutoEnableSaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+    }
+
+    private func scheduleComputerHarnessCommandSave() {
+        computerHarnessSaveWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            (NSApp.delegate as? AppDelegate)?.setComputerHarnessCommand(self.computerHarnessField.stringValue)
+        }
+        computerHarnessSaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+    }
+
     @objc private func showComputerInfo() {
         if let computerInfoPopover, computerInfoPopover.isShown {
             computerInfoPopover.performClose(nil)
             return
         }
 
-        let label = NSTextField(labelWithString: "When Computer controls are on, each transcript runs through a local shell command with full execution permissions.\nBy default it runs Codex with low reasoning effort.\nAuto enable only works when its switch is on and the phrase has at least two words.")
+        let label = NSTextField(labelWithString: "When Computer mode is on, each transcript runs through a local shell command with full execution permissions.\nBy default it runs Codex with low reasoning effort.\nAuto enable only works when its switch is on and the phrase has at least two words.")
         label.font = .systemFont(ofSize: 12)
         label.textColor = .labelColor
         label.lineBreakMode = .byWordWrapping
