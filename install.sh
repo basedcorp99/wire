@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+source "$ROOT/script/signing.sh"
 APP="$ROOT/dist/wire.app"
 DEST="/Applications/wire.app"
 BINARY="$APP/Contents/MacOS/wire"
@@ -17,10 +18,6 @@ else
     fi
   done < <(find "$ROOT/Sources" -type f -name '*.swift'; printf '%s\n' "$ROOT/Package.swift" "$ROOT/Assets/wire.icns")
 fi
-
-sign_app() {
-  /usr/bin/codesign --force --deep --sign - "$1" >/dev/null
-}
 
 package_app() {
   rm -rf "$APP"
@@ -62,7 +59,7 @@ if [[ -e "$DEST" ]]; then
   rm -rf "$DEST" 2>/dev/null || sudo rm -rf "$DEST"
 fi
 cp -R "$APP" "$DEST" 2>/dev/null || sudo cp -R "$APP" "$DEST"
-sign_app "$DEST" 2>/dev/null || sudo /usr/bin/codesign --force --deep --sign - "$DEST" >/dev/null
+sign_app "$DEST" 2>/dev/null || sudo WIRE_CODESIGN_IDENTITY="$WIRE_CODESIGN_IDENTITY" bash -c 'source "$0"; sign_app "$1"' "$ROOT/script/signing.sh" "$DEST"
 
 echo "Installed: $DEST"
 open "$DEST" || true

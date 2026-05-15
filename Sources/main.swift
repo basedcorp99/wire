@@ -110,6 +110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? LaunchAtLogin.setEnabled(true)
         }
         scheduleInitialAccessibilityCheck()
+        scheduleInitialMicrophoneCheck()
 
         // Pre-warm the API client and check auth
         Task {
@@ -212,6 +213,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             guard !recorder.isRecording else { return }
             guard state.transcriptionStage != .transcribing else { return }
+
+            guard await ensureMicrophonePermission() else {
+                state.statusText = "Enable Microphone permission for wire"
+                state.transcriptionStage = .error("Microphone permission missing")
+                state.isBusy = false
+                openMicrophoneSettings()
+                return
+            }
+
             state.lastTranscription = ""
             state.transcriptionStage = .recording
             state.statusText = status
@@ -297,6 +307,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openAccessibilitySettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func scheduleInitialMicrophoneCheck() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.requestMicrophonePermissionIfNeeded()
+        }
+    }
+
+    private func ensureMicrophonePermission() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return true
+        case .notDetermined:
+            return await withCheckedContinuation { continuation in
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    continuation.resume(returning: granted)
+                }
+            }
+        case .denied, .restricted:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
+    private func requestMicrophonePermissionIfNeeded() {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DispatchQueue.main.async {
+                    self?.state.statusText = granted ? "Microphone ready" : "Enable Microphone permission for wire"
+                    if !granted { self?.openMicrophoneSettings() }
+                }
+            }
+        case .denied, .restricted:
+            state.statusText = "Enable Microphone permission for wire"
+            openMicrophoneSettings()
+        @unknown default:
+            state.statusText = "Enable Microphone permission for wire"
+            openMicrophoneSettings()
+        }
+    }
+
+    private func openMicrophoneSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
             NSWorkspace.shared.open(url)
         }
     }

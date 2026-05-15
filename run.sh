@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+source "$ROOT/script/signing.sh"
 APP="$ROOT/dist/wire.app"
 BINARY="$APP/Contents/MacOS/wire"
 
@@ -16,10 +17,6 @@ else
     fi
   done < <(find "$ROOT/Sources" -type f -name '*.swift'; printf '%s\n' "$ROOT/Package.swift" "$ROOT/Assets/wire.icns")
 fi
-
-sign_app() {
-  /usr/bin/codesign --force --deep --sign - "$1" >/dev/null
-}
 
 package_app() {
   rm -rf "$APP"
