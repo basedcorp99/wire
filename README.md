@@ -38,13 +38,14 @@ and opens it. If `/Applications` requires admin rights, the script will ask via 
 
 ## Usage
 
-- Menu bar icon: microphone only.
+- Menu bar icon: click the microphone to open settings and the latest transcript.
 - Two shortcuts are available:
-  - **Toggle shortcut**: press once to start, again to stop and transcribe.
-  - **Hold shortcut**: hold to record, release to stop and transcribe.
+  - **Hold shortcut**: hold to record, release to stop and transcribe. Default: `⌃⌥M`.
+  - **Toggle shortcut**: press once to start, again to stop and transcribe. Default: `⌘⇧M`.
+- Click either shortcut button to reset it. While recording a new shortcut, the button shows `Listening…`, then updates live as you press modifiers/keys (for example `⌘⇧M`). It saves when all keys are released; press `Esc` to cancel.
 - The latest transcript appears in the popover, with a copy button beside it.
-- If **Paste result** is enabled, the transcript is copied to the clipboard and pasted into the active app.
-- Enable **Launch at login** in Settings to start `wire` automatically when you log in.
+- Transcripts are always copied to the clipboard. If Accessibility permission is granted, `wire` also pastes the transcript into the active app.
+- On launch, `wire` attempts to register itself as a login item so it starts automatically when you log in.
 
 ## Troubleshooting
 
