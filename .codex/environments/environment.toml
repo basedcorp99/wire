@@ -1,0 +1,2 @@
+[actions]
+Run = "./script/build_and_run.sh"
