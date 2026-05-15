@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP="$ROOT/dist/wire.app"
 DEST="/Applications/wire.app"
-BINARY="$APP/Contents/MacOS/SimpleTranscriber"
+BINARY="$APP/Contents/MacOS/wire"
 
 needs_build=0
 if [[ ! -x "$BINARY" ]]; then
@@ -18,17 +18,22 @@ else
   done < <(find "$ROOT/Sources" -type f -name '*.swift'; printf '%s\n' "$ROOT/Package.swift" "$ROOT/Assets/wire.icns")
 fi
 
+sign_app() {
+  /usr/bin/codesign --force --deep --sign - "$1" >/dev/null
+}
+
 package_app() {
+  rm -rf "$APP"
   mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-  cp "$ROOT/.build/release/SimpleTranscriber" "$APP/Contents/MacOS/SimpleTranscriber"
-  chmod +x "$APP/Contents/MacOS/SimpleTranscriber"
+  cp "$ROOT/.build/release/wire" "$APP/Contents/MacOS/wire"
+  chmod +x "$APP/Contents/MacOS/wire"
   cp "$ROOT/Assets/wire.icns" "$APP/Contents/Resources/wire.icns"
   cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleExecutable</key><string>SimpleTranscriber</string>
+  <key>CFBundleExecutable</key><string>wire</string>
   <key>CFBundleIdentifier</key><string>local.wire</string>
   <key>CFBundleName</key><string>wire</string>
   <key>CFBundleDisplayName</key><string>wire</string>
@@ -41,12 +46,15 @@ package_app() {
 </dict>
 </plist>
 PLIST
+  sign_app "$APP"
 }
 
 if [[ "$needs_build" == "1" ]]; then
   echo "Building wire…"
   swift build -c release --package-path "$ROOT"
   package_app
+else
+  sign_app "$APP"
 fi
 
 echo "Installing wire to /Applications…"
@@ -54,6 +62,7 @@ if [[ -e "$DEST" ]]; then
   rm -rf "$DEST" 2>/dev/null || sudo rm -rf "$DEST"
 fi
 cp -R "$APP" "$DEST" 2>/dev/null || sudo cp -R "$APP" "$DEST"
+sign_app "$DEST" 2>/dev/null || sudo /usr/bin/codesign --force --deep --sign - "$DEST" >/dev/null
 
 echo "Installed: $DEST"
 open "$DEST" || true

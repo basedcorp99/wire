@@ -59,7 +59,7 @@ If transcription hangs or fails:
 2. Relaunch the app:
 
    ```bash
-   killall SimpleTranscriber 2>/dev/null
+   killall wire 2>/dev/null
    ./run.sh
    ```
 

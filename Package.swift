@@ -2,16 +2,16 @@
 import PackageDescription
 
 let package = Package(
-    name: "SimpleTranscriber",
+    name: "wire",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "SimpleTranscriber", targets: ["SimpleTranscriber"])
+        .executable(name: "wire", targets: ["wire"])
     ],
     targets: [
         .executableTarget(
-            name: "SimpleTranscriber",
+            name: "wire",
             path: "Sources"
         )
     ]

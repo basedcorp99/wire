@@ -98,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 320, height: 380)
+        popover.contentSize = NSSize(width: 300, height: 256)
         popover.contentViewController = controller
 
         state.onChange = { [weak self, weak controller] in
@@ -106,11 +106,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             controller?.refresh()
         }
         hotKeyManager.registerSavedShortcut()
-
-        // Ask macOS to show wire in Privacy & Security → Accessibility if paste is enabled.
-        if state.returnToPreviousApp {
-            requestAccessibilityPermission(prompt: true)
+        if SMAppService.mainApp.status == .notRegistered {
+            try? LaunchAtLogin.setEnabled(true)
         }
+        scheduleInitialAccessibilityCheck()
 
         // Pre-warm the API client and check auth
         Task {
@@ -263,9 +262,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 pasteboard.clearContents()
                 pasteboard.setString(text, forType: .string)
 
-                if state.returnToPreviousApp {
-                    typeText(text)
-                }
+                typeText(text)
             } catch {
                 state.statusText = "Error: \(error.localizedDescription)"
                 state.transcriptionStage = .error(error.localizedDescription)
@@ -278,6 +275,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func requestAccessibilityPermission(prompt: Bool) -> Bool {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)
+    }
+
+    private func scheduleInitialAccessibilityCheck() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+            self?.openAccessibilitySettingsOnceIfNeeded()
+        }
+    }
+
+    private func openAccessibilitySettingsOnceIfNeeded() {
+        guard !requestAccessibilityPermission(prompt: false) else { return }
+        let key = "didOpenAccessibilitySettings.wireExecutable"
+        guard !UserDefaults.standard.bool(forKey: key) else {
+            state.statusText = "Enable Accessibility permission for wire to paste"
+            return
+        }
+        UserDefaults.standard.set(true, forKey: key)
+        state.statusText = "Enable Accessibility permission for wire to paste"
+        openAccessibilitySettings()
     }
 
     private func openAccessibilitySettings() {
@@ -355,7 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func typeText(_ text: String) {
-        guard requestAccessibilityPermission(prompt: true) else {
+        guard requestAccessibilityPermission(prompt: false) else {
             state.statusText = "Enable Accessibility permission for wire to paste"
             openAccessibilitySettings()
             return
@@ -404,13 +419,6 @@ final class AppState {
         get { RecordingMode(rawValue: UserDefaults.standard.integer(forKey: "recordingMode")) ?? .toggle }
         set {
             UserDefaults.standard.set(newValue.rawValue, forKey: "recordingMode")
-            onChange?()
-        }
-    }
-    var returnToPreviousApp: Bool {
-        get { UserDefaults.standard.object(forKey: "returnToPreviousApp") as? Bool ?? true }
-        set {
-            UserDefaults.standard.set(newValue, forKey: "returnToPreviousApp")
             onChange?()
         }
     }
@@ -783,16 +791,66 @@ enum AppError: LocalizedError {
 
 // MARK: - Popover View Controller
 
+final class HoverMenuButton: NSButton {
+    private var isHovering = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach { removeTrackingArea($0) }
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+        updateBackground()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+        updateBackground()
+    }
+
+    override func layout() {
+        super.layout()
+        layer?.cornerRadius = bounds.height / 2
+    }
+
+    private func setup() {
+        wantsLayer = true
+        layer?.masksToBounds = true
+        updateBackground()
+    }
+
+    private func updateBackground() {
+        layer?.cornerRadius = bounds.height / 2
+        layer?.backgroundColor = isHovering
+            ? NSColor.labelColor.withAlphaComponent(0.07).cgColor
+            : NSColor.clear.cgColor
+    }
+}
+
 final class PopoverViewController: NSViewController {
     private let state: AppState
     private let hotKeyManager: HotKeyManager
     private let statusLabel = NSTextField(labelWithString: "")
     private let shortcutButton = NSButton(title: "", target: nil, action: nil)
-    private let actionButton = NSButton(title: "", target: nil, action: nil)
     private let transcriptLabel = NSTextField(labelWithString: "No recent transcription")
     private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
-    private let pasteToggle = NSButton(checkboxWithTitle: "Paste into active app", target: nil, action: nil)
-    private let launchAtLoginToggle = NSButton(checkboxWithTitle: "Launch at login", target: nil, action: nil)
     private let modeControl = NSSegmentedControl(labels: ["Toggle", "Hold"], trackingMode: .selectOne, target: nil, action: nil)
     private let loadingIndicator = NSProgressIndicator()
     private var shortcutMonitor: Any?
@@ -808,7 +866,7 @@ final class PopoverViewController: NSViewController {
     }
 
     override func loadView() {
-        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 320, height: 380))
+        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 300, height: 256))
         visual.material = .menu
         visual.blendingMode = .behindWindow
         visual.state = .active
@@ -821,7 +879,7 @@ final class PopoverViewController: NSViewController {
         let root = NSStackView()
         root.orientation = .vertical
         root.spacing = 0
-        root.edgeInsets = NSEdgeInsets(top: 10, left: 0, bottom: 8, right: 0)
+        root.edgeInsets = NSEdgeInsets(top: 8, left: 0, bottom: 6, right: 0)
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
         NSLayoutConstraint.activate([
@@ -835,23 +893,30 @@ final class PopoverViewController: NSViewController {
         header.orientation = .horizontal
         header.alignment = .centerY
         header.spacing = 10
-        header.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 10, right: 16)
+        header.edgeInsets = NSEdgeInsets(top: 6, left: 14, bottom: 8, right: 14)
 
         let mic = NSImageView(image: NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil) ?? NSImage())
-        mic.symbolConfiguration = .init(pointSize: 20, weight: .semibold)
+        mic.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
         mic.contentTintColor = .controlAccentColor
-        mic.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        mic.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        mic.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        mic.heightAnchor.constraint(equalToConstant: 14).isActive = true
+
+        let titleRow = NSStackView()
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 5
+        let title = NSTextField(labelWithString: "wire")
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        titleRow.addArrangedSubview(mic)
+        titleRow.addArrangedSubview(title)
 
         let titleStack = NSStackView()
         titleStack.orientation = .vertical
         titleStack.spacing = 2
-        let title = NSTextField(labelWithString: "wire")
-        title.font = .systemFont(ofSize: 14, weight: .semibold)
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
-        titleStack.addArrangedSubview(title)
+        titleStack.addArrangedSubview(titleRow)
         titleStack.addArrangedSubview(statusLabel)
 
         loadingIndicator.style = .spinning
@@ -861,17 +926,10 @@ final class PopoverViewController: NSViewController {
         loadingIndicator.widthAnchor.constraint(equalToConstant: 16).isActive = true
         loadingIndicator.heightAnchor.constraint(equalToConstant: 16).isActive = true
 
-        header.addArrangedSubview(mic)
         header.addArrangedSubview(titleStack)
         header.addArrangedSubview(loadingIndicator)
         root.addArrangedSubview(header)
         root.addArrangedSubview(divider())
-
-        actionButton.target = self
-        actionButton.action = #selector(trigger)
-        actionButton.bezelStyle = .rounded
-        actionButton.controlSize = .large
-        root.addArrangedSubview(padded(actionButton, left: 14, right: 14, top: 12, bottom: 10))
 
         root.addArrangedSubview(sectionLabel("Settings"))
         shortcutButton.target = self
@@ -882,14 +940,7 @@ final class PopoverViewController: NSViewController {
         modeControl.action = #selector(modeChanged)
         modeControl.segmentStyle = .rounded
         root.addArrangedSubview(menuRow(symbol: "switch.2", title: "Record mode", trailing: modeControl))
-
-        pasteToggle.target = self
-        pasteToggle.action = #selector(returnFocusChanged)
-        root.addArrangedSubview(menuRow(symbol: "doc.on.clipboard", title: "Paste result", trailing: pasteToggle))
-
-        launchAtLoginToggle.target = self
-        launchAtLoginToggle.action = #selector(launchAtLoginChanged)
-        root.addArrangedSubview(menuRow(symbol: "powerplug", title: "Startup", trailing: launchAtLoginToggle))
+        root.addArrangedSubview(spacer(height: 8))
 
         root.addArrangedSubview(divider())
         root.addArrangedSubview(sectionLabel("Latest"))
@@ -919,7 +970,7 @@ final class PopoverViewController: NSViewController {
         latestRow.spacing = 8
         latestRow.addArrangedSubview(transcriptLabel)
         latestRow.addArrangedSubview(copyLatestButton)
-        root.addArrangedSubview(padded(latestRow, left: 16, right: 16, top: 4, bottom: 10))
+        root.addArrangedSubview(padded(latestRow, left: 14, right: 14, top: 3, bottom: 8))
 
         root.addArrangedSubview(divider())
         root.addArrangedSubview(clickableMenuRow(symbol: "power", title: "Quit", action: #selector(quitApp)))
@@ -931,11 +982,17 @@ final class PopoverViewController: NSViewController {
         return box
     }
 
+    private func spacer(height: CGFloat) -> NSView {
+        let view = NSView()
+        view.heightAnchor.constraint(equalToConstant: height).isActive = true
+        return view
+    }
+
     private func sectionLabel(_ text: String) -> NSView {
         let label = NSTextField(labelWithString: text.uppercased())
         label.font = .systemFont(ofSize: 10, weight: .medium)
         label.textColor = .tertiaryLabelColor
-        return padded(label, left: 16, right: 16, top: 10, bottom: 4)
+        return padded(label, left: 14, right: 14, top: 8, bottom: 3)
     }
 
     private func padded(_ child: NSView, left: CGFloat, right: CGFloat, top: CGFloat, bottom: CGFloat) -> NSView {
@@ -956,7 +1013,7 @@ final class PopoverViewController: NSViewController {
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 10
-        row.edgeInsets = NSEdgeInsets(top: 5, left: 16, bottom: 5, right: 16)
+        row.edgeInsets = NSEdgeInsets(top: 4, left: 14, bottom: 4, right: 14)
 
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
         icon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
@@ -974,20 +1031,26 @@ final class PopoverViewController: NSViewController {
     }
 
     private func clickableMenuRow(symbol: String, title: String, action: Selector) -> NSView {
-        let button = NSButton(title: "", target: self, action: action)
+        let button = HoverMenuButton(title: "", target: self, action: action)
         return clickableMenuRow(symbol: symbol, title: title, button: button)
     }
 
     private func clickableMenuRow(symbol: String, title: String, button: NSButton) -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        button.translatesAutoresizingMaskIntoConstraints = false
         button.bezelStyle = .inline
         button.isBordered = false
-        button.alignment = .left
+        button.alignment = .center
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentHuggingPriority(.required, for: .vertical)
+        container.addSubview(button)
 
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 10
-        row.edgeInsets = NSEdgeInsets(top: 7, left: 16, bottom: 7, right: 16)
+        row.spacing = 8
         row.translatesAutoresizingMaskIntoConstraints = false
 
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
@@ -1002,13 +1065,15 @@ final class PopoverViewController: NSViewController {
         row.addArrangedSubview(label)
         button.addSubview(row)
         NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: button.leadingAnchor),
-            row.trailingAnchor.constraint(equalTo: button.trailingAnchor),
-            row.topAnchor.constraint(equalTo: button.topAnchor),
-            row.bottomAnchor.constraint(equalTo: button.bottomAnchor),
-            button.heightAnchor.constraint(equalToConstant: 32)
+            container.heightAnchor.constraint(equalToConstant: 38),
+            button.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            button.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            button.widthAnchor.constraint(equalToConstant: 108),
+            button.heightAnchor.constraint(equalToConstant: 30),
+            row.centerXAnchor.constraint(equalTo: button.centerXAnchor),
+            row.centerYAnchor.constraint(equalTo: button.centerYAnchor)
         ])
-        return button
+        return container
     }
 
     func refresh() {
@@ -1016,21 +1081,15 @@ final class PopoverViewController: NSViewController {
         DispatchQueue.main.async {
             self.statusLabel.stringValue = self.state.statusText.isEmpty ? "Ready" : self.state.statusText
             self.shortcutButton.title = self.hotKeyManager.shortcutDisplay
-            self.pasteToggle.state = self.state.returnToPreviousApp ? .on : .off
-            self.launchAtLoginToggle.state = LaunchAtLogin.isEnabled ? .on : .off
-            self.launchAtLoginToggle.toolTip = LaunchAtLogin.statusDescription
             self.modeControl.selectedSegment = self.state.recordingMode.rawValue
 
             switch self.state.transcriptionStage {
             case .recording:
                 self.loadingIndicator.stopAnimation(nil)
-                self.actionButton.title = self.state.recordingMode == .pushToTalk ? "Recording… release hotkey" : "Stop & Transcribe"
             case .transcribing:
                 self.loadingIndicator.startAnimation(nil)
-                self.actionButton.title = "Loading…"
             default:
                 self.loadingIndicator.stopAnimation(nil)
-                self.actionButton.title = "Start Recording"
             }
 
             if self.state.transcriptionStage == .transcribing {
@@ -1052,25 +1111,6 @@ final class PopoverViewController: NSViewController {
         pasteboard.clearContents()
         pasteboard.setString(state.lastTranscription, forType: .string)
         state.statusText = "Copied latest transcription"
-    }
-
-    @objc private func returnFocusChanged() {
-        state.returnToPreviousApp = pasteToggle.state == .on
-    }
-
-    @objc private func launchAtLoginChanged() {
-        let shouldEnable = launchAtLoginToggle.state == .on
-        do {
-            try LaunchAtLogin.setEnabled(shouldEnable)
-            state.statusText = LaunchAtLogin.statusDescription
-            if SMAppService.mainApp.status == .requiresApproval {
-                LaunchAtLogin.openLoginItemsSettings()
-            }
-        } catch {
-            launchAtLoginToggle.state = LaunchAtLogin.isEnabled ? .on : .off
-            state.statusText = "Startup failed: \(error.localizedDescription)"
-        }
-        refresh()
     }
 
     @objc private func modeChanged() {
