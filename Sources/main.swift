@@ -63,6 +63,9 @@ enum LaunchAtLogin {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let sendEnterAfterPasteDefaultsKey = "sendEnterAfterPaste"
     private static let headsetControlsEnabledDefaultsKey = "headsetControlsEnabled"
+    private static let computerControlsEnabledDefaultsKey = "computerControlsEnabled"
+    private static let computerAutoEnableEnabledDefaultsKey = "computerAutoEnableEnabled"
+    private static let computerAutoEnablePhraseDefaultsKey = "computerAutoEnablePhrase"
 
     private let state = AppState()
     private var statusItem: NSStatusItem!
@@ -85,6 +88,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         state.sendEnterAfterPaste = UserDefaults.standard.bool(forKey: Self.sendEnterAfterPasteDefaultsKey)
         state.headsetControlsEnabled = (UserDefaults.standard.object(forKey: Self.headsetControlsEnabledDefaultsKey) as? Bool) ?? true
+        state.computerControlsEnabled = UserDefaults.standard.bool(forKey: Self.computerControlsEnabledDefaultsKey)
+        state.computerAutoEnableEnabled = UserDefaults.standard.bool(forKey: Self.computerAutoEnableEnabledDefaultsKey)
+        state.computerAutoEnablePhrase = UserDefaults.standard.string(forKey: Self.computerAutoEnablePhraseDefaultsKey) ?? ""
 
         // Initialize components
         codexClient = CodexAPIClient()
@@ -124,7 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 300, height: 386)
+        popover.contentSize = NSSize(width: 300, height: 420)
         popover.contentViewController = controller
 
         state.onChange = { [weak self, weak controller] in
@@ -476,7 +482,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 pasteboard.clearContents()
                 pasteboard.setString(text, forType: .string)
 
-                typeText(text, pressReturnAfterPaste: shouldPressReturnAfterPaste)
+                if !handleComputerTranscript(text) {
+                    typeText(text, pressReturnAfterPaste: shouldPressReturnAfterPaste)
+                }
             } catch {
                 if isASRBackendFailure(error) {
                     state.statusText = "Error: speech recognition failed. Try again."
@@ -693,6 +701,138 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func handleComputerTranscript(_ text: String) -> Bool {
+        if !state.computerControlsEnabled {
+            let phrase = state.computerAutoEnablePhrase.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard state.computerAutoEnableEnabled,
+                  normalizedPhrase(phrase).split(separator: " ").count >= 2,
+                  fuzzyMatches(text, phrase) else { return false }
+            setComputerControlsEnabled(true)
+            state.statusText = "Computer controls enabled"
+            return true
+        }
+
+        executeComputerPrompt(text)
+        return true
+    }
+
+    private func executeComputerPrompt(_ prompt: String) {
+        guard !state.computerCommandRunning else {
+            state.statusText = "Codex is already running"
+            return
+        }
+
+        state.computerCommandRunning = true
+        state.statusText = "Running Codex"
+
+        let process = Process()
+        if FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/codex") {
+            process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/codex")
+            process.arguments = ["--yolo", "e", prompt]
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["codex", "--yolo", "e", prompt]
+        }
+        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        let captureQueue = DispatchQueue(label: "wire.codex-command-capture")
+        var stdoutData = Data()
+        var stderrData = Data()
+
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            captureQueue.async {
+                stdoutData.append(data)
+            }
+        }
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            captureQueue.async {
+                stderrData.append(data)
+            }
+        }
+
+        process.terminationHandler = { [weak self] process in
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            errorPipe.fileHandleForReading.readabilityHandler = nil
+            captureQueue.async {
+                stdoutData.append(outputPipe.fileHandleForReading.readDataToEndOfFile())
+                stderrData.append(errorPipe.fileHandleForReading.readDataToEndOfFile())
+                let status = process.terminationStatus
+                DispatchQueue.main.async {
+                    self?.state.computerCommandRunning = false
+                    self?.state.statusText = status == 0 ? "Codex finished" : "Codex exited \(status)"
+                }
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            errorPipe.fileHandleForReading.readabilityHandler = nil
+            state.computerCommandRunning = false
+            state.statusText = "Could not run Codex: \(error.localizedDescription)"
+            state.transcriptionStage = .error(error.localizedDescription)
+        }
+    }
+
+    private func fuzzyMatches(_ transcript: String, _ phrase: String) -> Bool {
+        let source = normalizedPhrase(transcript)
+        let target = normalizedPhrase(phrase)
+        guard !source.isEmpty, !target.isEmpty else { return false }
+        if source == target || source.contains(target) || target.contains(source) {
+            return true
+        }
+
+        let distance = levenshteinDistance(source, target)
+        let maxLength = max(source.count, target.count)
+        guard maxLength > 0 else { return false }
+        let similarity = 1.0 - (Double(distance) / Double(maxLength))
+        return similarity >= 0.82
+    }
+
+    private func normalizedPhrase(_ text: String) -> String {
+        text.lowercased()
+            .unicodeScalars
+            .map { CharacterSet.alphanumerics.contains($0) ? Character($0) : " " }
+            .reduce(into: "") { $0.append($1) }
+            .split(separator: " ")
+            .joined(separator: " ")
+    }
+
+    private func levenshteinDistance(_ lhs: String, _ rhs: String) -> Int {
+        let a = Array(lhs)
+        let b = Array(rhs)
+        if a.isEmpty { return b.count }
+        if b.isEmpty { return a.count }
+
+        var previous = Array(0...b.count)
+        var current = Array(repeating: 0, count: b.count + 1)
+
+        for i in 1...a.count {
+            current[0] = i
+            for j in 1...b.count {
+                let cost = a[i - 1] == b[j - 1] ? 0 : 1
+                current[j] = min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + cost
+                )
+            }
+            swap(&previous, &current)
+        }
+
+        return previous[b.count]
+    }
+
     func setHeadsetControlsEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: Self.headsetControlsEnabledDefaultsKey)
         state.headsetControlsEnabled = enabled
@@ -704,6 +844,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(enabled, forKey: Self.sendEnterAfterPasteDefaultsKey)
         state.sendEnterAfterPaste = enabled
         state.statusText = enabled ? "Headset recordings will press Return after pasting" : "Return after paste disabled"
+    }
+
+    func setComputerControlsEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.computerControlsEnabledDefaultsKey)
+        state.computerControlsEnabled = enabled
+        state.statusText = enabled ? "Computer controls enabled" : "Computer controls disabled"
+    }
+
+    func setComputerAutoEnableEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.computerAutoEnableEnabledDefaultsKey)
+        state.computerAutoEnableEnabled = enabled
+        state.statusText = enabled ? "Auto enable enabled" : "Auto enable disabled"
+    }
+
+    func setComputerAutoEnablePhrase(_ phrase: String) {
+        UserDefaults.standard.set(phrase, forKey: Self.computerAutoEnablePhraseDefaultsKey)
+        state.computerAutoEnablePhrase = phrase
+        state.statusText = phrase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Auto enable phrase cleared"
+            : "Auto enable phrase saved"
     }
 
     private func pressReturnKey() {
@@ -735,6 +895,10 @@ final class AppState {
     var transcriptionStage: TranscriptionStage = .idle { didSet { onChange?() } }
     var sendEnterAfterPaste = false { didSet { onChange?() } }
     var headsetControlsEnabled = true { didSet { onChange?() } }
+    var computerControlsEnabled = false { didSet { onChange?() } }
+    var computerAutoEnableEnabled = false { didSet { onChange?() } }
+    var computerAutoEnablePhrase = "" { didSet { onChange?() } }
+    var computerCommandRunning = false { didSet { onChange?() } }
 }
 
 // MARK: - Headset Controls
@@ -1921,11 +2085,15 @@ final class HoverMenuButton: NSButton {
     }
 }
 
-final class PopoverViewController: NSViewController {
+final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private enum Layout {
         static let width: CGFloat = 300
-        static let expandedHeight: CGFloat = 386
-        static let collapsedHeight: CGFloat = 322
+        static let headsetExpandedComputerOffHeight: CGFloat = 420
+        static let headsetExpandedComputerOnHeight: CGFloat = 462
+        static let headsetExpandedComputerAutoOnHeight: CGFloat = 498
+        static let headsetCollapsedComputerOffHeight: CGFloat = 356
+        static let headsetCollapsedComputerOnHeight: CGFloat = 398
+        static let headsetCollapsedComputerAutoOnHeight: CGFloat = 434
     }
 
     private let state: AppState
@@ -1939,12 +2107,19 @@ final class PopoverViewController: NSViewController {
     private let sendEnterAfterPasteSwitch = NSSwitch()
     private let airPodsControlSwitch = NSSwitch()
     private let airPodsInfoButton = NSButton(title: "", target: nil, action: nil)
+    private let computerControlsSwitch = NSSwitch()
+    private let computerInfoButton = NSButton(title: "", target: nil, action: nil)
+    private let computerAutoEnableSwitch = NSSwitch()
+    private let computerAutoEnableField = NSTextField(string: "")
     private let transcriptLabel = NSTextField(labelWithString: "No recent transcription")
     private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
     private let loadingIndicator = NSProgressIndicator()
     private var headsetSettingsRows: [NSView] = []
+    private var computerSettingsRows: [NSView] = []
+    private var computerAutoEnableRows: [NSView] = []
     private var headsetCollapsedSpacer: NSView?
     private var airPodsInfoPopover: NSPopover?
+    private var computerInfoPopover: NSPopover?
     private var shortcutMonitor: Any?
     private var shortcutCaptureTarget: HotKeyKind?
     private var shortcutCaptureKeyCode: UInt32?
@@ -1964,7 +2139,7 @@ final class PopoverViewController: NSViewController {
     }
 
     override func loadView() {
-        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: Layout.width, height: Layout.expandedHeight))
+        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: Layout.width, height: Layout.headsetExpandedComputerOffHeight))
         visual.material = .menu
         visual.blendingMode = .behindWindow
         visual.state = .active
@@ -2106,6 +2281,43 @@ final class PopoverViewController: NSViewController {
         let headsetBottomSpacer = spacer(height: 5)
         root.addArrangedSubview(headsetBottomSpacer)
         headsetSettingsRows = [wiredButtonRow, airPodsControlRow, sendEnterRow, headsetBottomSpacer]
+
+        root.addArrangedSubview(divider())
+        root.addArrangedSubview(sectionLabel("Computer"))
+        configureSwitch(computerControlsSwitch, action: #selector(toggleComputerControls))
+        computerInfoButton.bezelStyle = .inline
+        computerInfoButton.isBordered = false
+        computerInfoButton.imagePosition = .imageOnly
+        computerInfoButton.target = self
+        computerInfoButton.action = #selector(showComputerInfo)
+        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Computer controls details") {
+            infoImage.isTemplate = true
+            computerInfoButton.image = infoImage
+        }
+        computerInfoButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        computerInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        root.addArrangedSubview(menuRow(symbol: "desktopcomputer", title: "Computer controls (dangerous)", trailing: trailingGroup([computerInfoButton, computerControlsSwitch])))
+
+        configureSwitch(computerAutoEnableSwitch, action: #selector(toggleComputerAutoEnable))
+        let autoEnableToggleRow = menuRow(symbol: "bolt.badge.automatic", title: "Auto enable", trailing: computerAutoEnableSwitch)
+        root.addArrangedSubview(autoEnableToggleRow)
+
+        computerAutoEnableField.placeholderString = "At least two words"
+        computerAutoEnableField.font = .systemFont(ofSize: 12)
+        computerAutoEnableField.bezelStyle = .roundedBezel
+        computerAutoEnableField.focusRingType = .none
+        computerAutoEnableField.controlSize = .small
+        computerAutoEnableField.delegate = self
+        computerAutoEnableField.target = self
+        computerAutoEnableField.action = #selector(updateComputerAutoEnablePhrase)
+        computerAutoEnableField.widthAnchor.constraint(equalToConstant: 142).isActive = true
+        computerAutoEnableField.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        let phraseRow = menuRow(symbol: "text.cursor", title: "Phrase", trailing: computerAutoEnableField)
+        root.addArrangedSubview(phraseRow)
+        let computerBottomSpacer = spacer(height: 9)
+        root.addArrangedSubview(computerBottomSpacer)
+        computerSettingsRows = [autoEnableToggleRow, computerBottomSpacer]
+        computerAutoEnableRows = [phraseRow]
 
         root.addArrangedSubview(divider())
         root.addArrangedSubview(clickableMenuRow(symbol: "power", title: "Quit", action: #selector(quitApp), destructive: true))
@@ -2260,28 +2472,56 @@ final class PopoverViewController: NSViewController {
             case .transcribing:
                 self.loadingIndicator.startAnimation(nil)
             default:
-                self.loadingIndicator.stopAnimation(nil)
+                if self.state.computerCommandRunning {
+                    self.loadingIndicator.startAnimation(nil)
+                } else {
+                    self.loadingIndicator.stopAnimation(nil)
+                }
             }
 
             self.headsetControlsSwitch.state = self.state.headsetControlsEnabled ? .on : .off
             self.headsetModePopup.selectItem(at: self.headsetProbeManager.currentMode.rawValue)
             self.airPodsControlSwitch.state = self.headsetProbeManager.isAirPodsControlEnabled ? .on : .off
             self.sendEnterAfterPasteSwitch.state = self.state.sendEnterAfterPaste ? .on : .off
+            self.computerControlsSwitch.state = self.state.computerControlsEnabled ? .on : .off
+            self.computerAutoEnableSwitch.state = self.state.computerAutoEnableEnabled ? .on : .off
+            if self.computerAutoEnableField.currentEditor() == nil {
+                self.computerAutoEnableField.stringValue = self.state.computerAutoEnablePhrase
+            }
             self.headsetModePopup.isEnabled = self.state.headsetControlsEnabled
             self.airPodsControlSwitch.isEnabled = self.state.headsetControlsEnabled
             self.airPodsInfoButton.isEnabled = self.state.headsetControlsEnabled
             self.sendEnterAfterPasteSwitch.isEnabled = self.state.headsetControlsEnabled
             self.headsetSettingsRows.forEach { $0.isHidden = !self.state.headsetControlsEnabled }
             self.headsetCollapsedSpacer?.isHidden = self.state.headsetControlsEnabled
-            let height = self.state.headsetControlsEnabled ? Layout.expandedHeight : Layout.collapsedHeight
+            self.computerSettingsRows.forEach { $0.isHidden = !self.state.computerControlsEnabled }
+            let showComputerPhrase = self.state.computerControlsEnabled && self.state.computerAutoEnableEnabled
+            self.computerAutoEnableRows.forEach { $0.isHidden = !showComputerPhrase }
+            let height: CGFloat
+            switch (self.state.headsetControlsEnabled, self.state.computerControlsEnabled, showComputerPhrase) {
+            case (true, true, true):
+                height = Layout.headsetExpandedComputerAutoOnHeight
+            case (true, true, false):
+                height = Layout.headsetExpandedComputerOnHeight
+            case (true, false, _):
+                height = Layout.headsetExpandedComputerOffHeight
+            case (false, true, true):
+                height = Layout.headsetCollapsedComputerAutoOnHeight
+            case (false, true, false):
+                height = Layout.headsetCollapsedComputerOnHeight
+            case (false, false, _):
+                height = Layout.headsetCollapsedComputerOffHeight
+            }
             self.preferredContentSize = NSSize(width: Layout.width, height: height)
 
-            if self.state.transcriptionStage == .transcribing {
+            if self.state.computerCommandRunning {
+                self.transcriptLabel.stringValue = "Running Codex..."
+            } else if self.state.transcriptionStage == .transcribing {
                 self.transcriptLabel.stringValue = "Loading… transcribing audio"
             } else {
                 self.transcriptLabel.stringValue = self.state.lastTranscription.isEmpty ? "No recent transcription" : self.state.lastTranscription
             }
-            self.copyLatestButton.isEnabled = !self.state.lastTranscription.isEmpty
+            self.copyLatestButton.isEnabled = !self.transcriptLabel.stringValue.isEmpty && self.transcriptLabel.stringValue != "No recent transcription"
         }
     }
 
@@ -2354,6 +2594,67 @@ final class PopoverViewController: NSViewController {
     @objc private func toggleSendEnterAfterPaste() {
         (NSApp.delegate as? AppDelegate)?.setSendEnterAfterPaste(sendEnterAfterPasteSwitch.state == .on)
         refresh()
+    }
+
+    @objc private func toggleComputerControls() {
+        (NSApp.delegate as? AppDelegate)?.setComputerControlsEnabled(computerControlsSwitch.state == .on)
+        view.window?.makeFirstResponder(nil)
+        refresh()
+    }
+
+    @objc private func toggleComputerAutoEnable() {
+        (NSApp.delegate as? AppDelegate)?.setComputerAutoEnableEnabled(computerAutoEnableSwitch.state == .on)
+        view.window?.makeFirstResponder(nil)
+        refresh()
+    }
+
+    @objc private func updateComputerAutoEnablePhrase() {
+        (NSApp.delegate as? AppDelegate)?.setComputerAutoEnablePhrase(computerAutoEnableField.stringValue)
+        view.window?.makeFirstResponder(nil)
+        refresh()
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard obj.object as? NSTextField === computerAutoEnableField else { return }
+        updateComputerAutoEnablePhrase()
+    }
+
+    @objc private func showComputerInfo() {
+        if let computerInfoPopover, computerInfoPopover.isShown {
+            computerInfoPopover.performClose(nil)
+            return
+        }
+
+        let label = NSTextField(labelWithString: "When Computer controls are on, each transcript runs through Codex with full local execution permissions.\nAuto enable only works when its switch is on and the phrase has at least two words.")
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 0
+        label.preferredMaxLayoutWidth = 218
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 242, height: 128))
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: 242),
+            container.heightAnchor.constraint(equalToConstant: 128),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10)
+        ])
+
+        let controller = NSViewController()
+        controller.view = container
+        controller.preferredContentSize = NSSize(width: 242, height: 128)
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 242, height: 128)
+        popover.contentViewController = controller
+        computerInfoPopover = popover
+        popover.show(relativeTo: computerInfoButton.bounds, of: computerInfoButton, preferredEdge: .maxY)
     }
 
     @objc private func captureToggleShortcut() {
