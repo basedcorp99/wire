@@ -133,9 +133,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hotKeyManager: hotKeyManager,
             headsetProbeManager: headsetProbeManager
         )
+        _ = controller.view
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 300, height: 420)
         popover.contentViewController = controller
 
         state.onChange = { [weak self, weak controller] in
@@ -700,7 +700,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         up?.post(tap: .cghidEventTap)
 
         if pressReturnAfterPaste {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            releaseCommandKeys(source: source)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { [weak self] in
                 self?.pressReturnKey()
             }
         }
@@ -907,8 +908,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let returnKey = CGKeyCode(kVK_Return)
         let down = CGEvent(keyboardEventSource: source, virtualKey: returnKey, keyDown: true)
         let up = CGEvent(keyboardEventSource: source, virtualKey: returnKey, keyDown: false)
+        down?.flags = []
+        up?.flags = []
         down?.post(tap: .cghidEventTap)
         up?.post(tap: .cghidEventTap)
+    }
+
+    private func releaseCommandKeys(source: CGEventSource?) {
+        for keyCode in [CGKeyCode(kVK_Command), CGKeyCode(kVK_RightCommand)] {
+            let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
+            up?.flags = []
+            up?.post(tap: .cghidEventTap)
+        }
     }
 }
 
@@ -2126,17 +2137,12 @@ final class HoverMenuButton: NSButton {
 final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private enum Layout {
         static let width: CGFloat = 300
-        static let headsetExpandedComputerOffHeight: CGFloat = 404
-        static let headsetCollapsedComputerOffHeight: CGFloat = 340
-        static let computerControlsExtraHeight: CGFloat = 70
-        static let computerHiddenCommandBottomPadding: CGFloat = 12
-        static let computerCommandExtraHeight: CGFloat = 36
-        static let computerAutoPhraseExtraHeight: CGFloat = 36
     }
 
     private let state: AppState
     private let hotKeyManager: HotKeyManager
     private let headsetProbeManager: HeadsetProbeManager
+    private let rootStack = NSStackView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let toggleShortcutButton = NSButton(title: "", target: nil, action: nil)
     private let holdShortcutButton = NSButton(title: "", target: nil, action: nil)
@@ -2182,7 +2188,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     }
 
     override func loadView() {
-        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: Layout.width, height: Layout.headsetExpandedComputerOffHeight))
+        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: Layout.width, height: 0))
         visual.material = .menu
         visual.blendingMode = .behindWindow
         visual.state = .active
@@ -2192,17 +2198,16 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     }
 
     private func buildUI() {
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.spacing = 0
-        root.detachesHiddenViews = true
-        root.edgeInsets = NSEdgeInsets(top: 8, left: 0, bottom: 6, right: 0)
-        root.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(root)
+        rootStack.orientation = .vertical
+        rootStack.spacing = 0
+        rootStack.detachesHiddenViews = true
+        rootStack.edgeInsets = NSEdgeInsets(top: 8, left: 0, bottom: 6, right: 0)
+        rootStack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(rootStack)
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            root.topAnchor.constraint(equalTo: view.topAnchor)
+            rootStack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            rootStack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            rootStack.topAnchor.constraint(equalTo: view.topAnchor)
         ])
 
         let header = NSStackView()
@@ -2244,10 +2249,10 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
 
         header.addArrangedSubview(titleStack)
         header.addArrangedSubview(loadingIndicator)
-        root.addArrangedSubview(header)
-        root.addArrangedSubview(divider())
+        rootStack.addArrangedSubview(header)
+        rootStack.addArrangedSubview(divider())
 
-        root.addArrangedSubview(sectionLabel("Latest"))
+        rootStack.addArrangedSubview(sectionLabel("Latest"))
         transcriptLabel.font = .systemFont(ofSize: 12)
         transcriptLabel.textColor = .secondaryLabelColor
         transcriptLabel.lineBreakMode = .byWordWrapping
@@ -2274,26 +2279,26 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         latestRow.spacing = 8
         latestRow.addArrangedSubview(transcriptLabel)
         latestRow.addArrangedSubview(copyLatestButton)
-        root.addArrangedSubview(padded(latestRow, left: 14, right: 14, top: 3, bottom: 8))
+        rootStack.addArrangedSubview(padded(latestRow, left: 14, right: 14, top: 3, bottom: 8))
 
-        root.addArrangedSubview(divider())
-        root.addArrangedSubview(sectionLabel("Settings"))
+        rootStack.addArrangedSubview(divider())
+        rootStack.addArrangedSubview(sectionLabel("Settings"))
         holdShortcutButton.target = self
         holdShortcutButton.action = #selector(captureHoldShortcut)
-        root.addArrangedSubview(menuRow(symbol: "keyboard.badge.ellipsis", title: "Hold shortcut", trailing: holdShortcutButton))
-        root.addArrangedSubview(spacer(height: 7))
+        rootStack.addArrangedSubview(menuRow(symbol: "keyboard.badge.ellipsis", title: "Hold shortcut", trailing: holdShortcutButton))
+        rootStack.addArrangedSubview(spacer(height: 7))
 
         toggleShortcutButton.target = self
         toggleShortcutButton.action = #selector(captureToggleShortcut)
-        root.addArrangedSubview(menuRow(symbol: "keyboard", title: "Toggle shortcut", trailing: toggleShortcutButton))
-        root.addArrangedSubview(spacer(height: 8))
+        rootStack.addArrangedSubview(menuRow(symbol: "keyboard", title: "Toggle shortcut", trailing: toggleShortcutButton))
+        rootStack.addArrangedSubview(spacer(height: 8))
 
-        root.addArrangedSubview(divider())
-        root.addArrangedSubview(sectionLabel("Headset"))
+        rootStack.addArrangedSubview(divider())
+        rootStack.addArrangedSubview(sectionLabel("Headset"))
         configureSwitch(headsetControlsSwitch, action: #selector(toggleHeadsetControls))
-        root.addArrangedSubview(menuRow(symbol: "switch.2", title: "Headset controls", trailing: headsetControlsSwitch))
+        rootStack.addArrangedSubview(menuRow(symbol: "switch.2", title: "Headset controls", trailing: headsetControlsSwitch))
         let collapsedSpacer = spacer(height: 7)
-        root.addArrangedSubview(collapsedSpacer)
+        rootStack.addArrangedSubview(collapsedSpacer)
         headsetCollapsedSpacer = collapsedSpacer
 
         headsetModePopup.addItems(withTitles: HeadsetButtonMode.allCases.map(\.title))
@@ -2301,7 +2306,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         headsetModePopup.action = #selector(changeHeadsetMode)
         headsetModePopup.widthAnchor.constraint(equalToConstant: 178).isActive = true
         let wiredButtonRow = menuRow(symbol: "headphones", title: "Wired", trailing: headsetModePopup)
-        root.addArrangedSubview(wiredButtonRow)
+        rootStack.addArrangedSubview(wiredButtonRow)
 
         configureSwitch(airPodsControlSwitch, action: #selector(toggleAirPodsControl))
         airPodsInfoButton.bezelStyle = .inline
@@ -2316,17 +2321,17 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         airPodsInfoButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
         airPodsInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
         let airPodsControlRow = menuRow(symbol: "airpodspro", title: "AirPods controls (experimental)", trailing: trailingGroup([airPodsInfoButton, airPodsControlSwitch]))
-        root.addArrangedSubview(airPodsControlRow)
+        rootStack.addArrangedSubview(airPodsControlRow)
 
         configureSwitch(sendEnterAfterPasteSwitch, action: #selector(toggleSendEnterAfterPaste))
         let sendEnterRow = menuRow(symbol: "return", title: "Press Return after paste", trailing: sendEnterAfterPasteSwitch)
-        root.addArrangedSubview(sendEnterRow)
+        rootStack.addArrangedSubview(sendEnterRow)
         let headsetBottomSpacer = spacer(height: 5)
-        root.addArrangedSubview(headsetBottomSpacer)
+        rootStack.addArrangedSubview(headsetBottomSpacer)
         headsetSettingsRows = [wiredButtonRow, airPodsControlRow, sendEnterRow, headsetBottomSpacer]
 
-        root.addArrangedSubview(divider())
-        root.addArrangedSubview(sectionLabel("Computer"))
+        rootStack.addArrangedSubview(divider())
+        rootStack.addArrangedSubview(sectionLabel("Computer"))
         configureSwitch(computerControlsSwitch, action: #selector(toggleComputerControls))
         computerInfoButton.bezelStyle = .inline
         computerInfoButton.isBordered = false
@@ -2339,7 +2344,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         }
         computerInfoButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
         computerInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
-        root.addArrangedSubview(menuRow(symbol: "desktopcomputer", title: "Computer controls (dangerous)", trailing: trailingGroup([computerInfoButton, computerControlsSwitch])))
+        rootStack.addArrangedSubview(menuRow(symbol: "desktopcomputer", title: "Computer controls (dangerous)", trailing: trailingGroup([computerInfoButton, computerControlsSwitch])))
 
         configureSwitch(computerCustomHarnessSwitch, action: #selector(toggleComputerCustomHarness))
         computerHarnessInfoButton.bezelStyle = .inline
@@ -2354,7 +2359,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         computerHarnessInfoButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
         computerHarnessInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
         let customHarnessToggleRow = menuRow(symbol: "terminal", title: "Custom harness", trailing: trailingGroup([computerHarnessInfoButton, computerCustomHarnessSwitch]))
-        root.addArrangedSubview(customHarnessToggleRow)
+        rootStack.addArrangedSubview(customHarnessToggleRow)
 
         computerHarnessField.placeholderString = "codex --yolo -c 'model_reasoning_effort=\"low\"' e {{prompt}}"
         computerHarnessField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -2367,11 +2372,11 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         computerHarnessField.widthAnchor.constraint(equalToConstant: 176).isActive = true
         computerHarnessField.heightAnchor.constraint(equalToConstant: 26).isActive = true
         let commandRow = menuRow(symbol: "chevron.right.square", title: "Command", trailing: computerHarnessField)
-        root.addArrangedSubview(commandRow)
+        rootStack.addArrangedSubview(commandRow)
 
         configureSwitch(computerAutoEnableSwitch, action: #selector(toggleComputerAutoEnable))
         let autoEnableToggleRow = menuRow(symbol: "bolt.badge.automatic", title: "Auto enable", trailing: computerAutoEnableSwitch)
-        root.addArrangedSubview(autoEnableToggleRow)
+        rootStack.addArrangedSubview(autoEnableToggleRow)
 
         computerAutoEnableField.placeholderString = "At least two words"
         computerAutoEnableField.font = .systemFont(ofSize: 12)
@@ -2384,15 +2389,15 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         computerAutoEnableField.widthAnchor.constraint(equalToConstant: 142).isActive = true
         computerAutoEnableField.heightAnchor.constraint(equalToConstant: 26).isActive = true
         let phraseRow = menuRow(symbol: "text.cursor", title: "Phrase", trailing: computerAutoEnableField)
-        root.addArrangedSubview(phraseRow)
+        rootStack.addArrangedSubview(phraseRow)
         let computerBottomSpacer = spacer(height: 9)
-        root.addArrangedSubview(computerBottomSpacer)
+        rootStack.addArrangedSubview(computerBottomSpacer)
         computerSettingsRows = [customHarnessToggleRow, autoEnableToggleRow, computerBottomSpacer]
         computerHarnessRows = [commandRow]
         computerAutoEnableRows = [phraseRow]
 
-        root.addArrangedSubview(divider())
-        root.addArrangedSubview(clickableMenuRow(symbol: "power", title: "Quit", action: #selector(quitApp), destructive: true))
+        rootStack.addArrangedSubview(divider())
+        rootStack.addArrangedSubview(clickableMenuRow(symbol: "power", title: "Quit", action: #selector(quitApp), destructive: true))
     }
 
     private func divider() -> NSBox {
@@ -2523,7 +2528,8 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
 
     func refresh() {
         guard isViewLoaded else { return }
-        DispatchQueue.main.async {
+        let apply = { [weak self] in
+            guard let self else { return }
             self.statusLabel.stringValue = self.state.statusText.isEmpty ? "Ready" : self.state.statusText
             if self.shortcutCaptureTarget == nil {
                 self.holdShortcutButton.title = self.hotKeyManager.holdShortcutDisplay
@@ -2575,20 +2581,6 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             self.computerHarnessRows.forEach { $0.isHidden = !showComputerCommand }
             let showComputerPhrase = self.state.computerControlsEnabled && self.state.computerAutoEnableEnabled
             self.computerAutoEnableRows.forEach { $0.isHidden = !showComputerPhrase }
-            var height = self.state.headsetControlsEnabled ? Layout.headsetExpandedComputerOffHeight : Layout.headsetCollapsedComputerOffHeight
-            if self.state.computerControlsEnabled {
-                height += Layout.computerControlsExtraHeight
-            }
-            if self.state.computerControlsEnabled && !showComputerCommand {
-                height += Layout.computerHiddenCommandBottomPadding
-            }
-            if showComputerCommand {
-                height += Layout.computerCommandExtraHeight
-            }
-            if showComputerPhrase {
-                height += Layout.computerAutoPhraseExtraHeight
-            }
-            self.preferredContentSize = NSSize(width: Layout.width, height: height)
 
             if self.state.computerCommandRunning {
                 let usesCustomHarness = self.state.computerCustomHarnessEnabled && !self.state.computerHarnessCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2599,7 +2591,23 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
                 self.transcriptLabel.stringValue = self.state.lastTranscription.isEmpty ? "No recent transcription" : self.state.lastTranscription
             }
             self.copyLatestButton.isEnabled = !self.transcriptLabel.stringValue.isEmpty && self.transcriptLabel.stringValue != "No recent transcription"
+            self.updatePreferredContentSize()
         }
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.async(execute: apply)
+        }
+    }
+
+    private func updatePreferredContentSize() {
+        let latestTextWidth = Layout.width - 14 - 14 - 8 - 24
+        transcriptLabel.preferredMaxLayoutWidth = latestTextWidth
+        view.layoutSubtreeIfNeeded()
+        rootStack.layoutSubtreeIfNeeded()
+
+        let height = ceil(rootStack.fittingSize.height)
+        preferredContentSize = NSSize(width: Layout.width, height: height)
     }
 
     @objc private func trigger() {
