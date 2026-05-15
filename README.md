@@ -39,9 +39,9 @@ and opens it. If `/Applications` requires admin rights, the script will ask via 
 ## Usage
 
 - Menu bar icon: microphone only.
-- Recording modes:
-  - **Toggle**: press shortcut once to start, again to stop and transcribe.
-  - **Hold**: hold shortcut to record, release to stop and transcribe.
+- Two shortcuts are available:
+  - **Toggle shortcut**: press once to start, again to stop and transcribe.
+  - **Hold shortcut**: hold to record, release to stop and transcribe.
 - The latest transcript appears in the popover, with a copy button beside it.
 - If **Paste result** is enabled, the transcript is copied to the clipboard and pasted into the active app.
 - Enable **Launch at login** in Settings to start `wire` automatically when you log in.

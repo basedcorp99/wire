@@ -65,6 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recorder: AudioRecorder!
     private var statusSpinnerTimer: Timer?
     private var statusSpinnerIndex = 0
+    private var activeRecordingKind: HotKeyKind?
     private let statusSpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -75,8 +76,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder = AudioRecorder()
         hotKeyManager = HotKeyManager(
             state: state,
-            onPressed: { [weak self] in self?.handleHotKeyPressed() },
-            onReleased: { [weak self] in self?.handleHotKeyReleased() }
+            onTogglePressed: { [weak self] in self?.handleToggleHotKeyPressed() },
+            onHoldPressed: { [weak self] in self?.handleHoldHotKeyPressed() },
+            onHoldReleased: { [weak self] in self?.handleHoldHotKeyReleased() }
         )
 
         // Setup menu bar: icon only
@@ -98,14 +100,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 300, height: 256)
+        popover.contentSize = NSSize(width: 300, height: 272)
         popover.contentViewController = controller
 
         state.onChange = { [weak self, weak controller] in
             self?.renderStatusItem()
             controller?.refresh()
         }
-        hotKeyManager.registerSavedShortcut()
+        hotKeyManager.registerSavedShortcuts()
         if SMAppService.mainApp.status == .notRegistered {
             try? LaunchAtLogin.setEnabled(true)
         }
@@ -187,17 +189,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusSpinnerIndex = 0
     }
 
-    private func handleHotKeyPressed() {
-        if state.recordingMode == .pushToTalk {
-            startRecording(status: "Recording… release shortcut to transcribe")
-        } else {
-            handleTranscribe()
-        }
+    private func handleToggleHotKeyPressed() {
+        handleTranscribe()
     }
 
-    private func handleHotKeyReleased() {
-        guard state.recordingMode == .pushToTalk else { return }
-        guard recorder.isRecording else { return }
+    private func handleHoldHotKeyPressed() {
+        startRecording(status: "Recording… release hold shortcut to transcribe", kind: .hold)
+    }
+
+    private func handleHoldHotKeyReleased() {
+        guard recorder.isRecording, activeRecordingKind == .hold else { return }
         stopAndTranscribe()
     }
 
@@ -205,11 +206,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if recorder.isRecording {
             stopAndTranscribe()
         } else {
-            startRecording(status: "Recording… press shortcut again to stop")
+            startRecording(status: "Recording… press toggle shortcut again to stop", kind: .toggle)
         }
     }
 
-    private func startRecording(status: String) {
+    private func startRecording(status: String, kind: HotKeyKind) {
         Task { @MainActor in
             guard !recorder.isRecording else { return }
             guard state.transcriptionStage != .transcribing else { return }
@@ -229,6 +230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             do {
                 try recorder.start()
+                activeRecordingKind = kind
             } catch {
                 state.statusText = "Could not start recording: \(error.localizedDescription)"
                 state.transcriptionStage = .error(error.localizedDescription)
@@ -244,6 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.transcriptionStage = .transcribing
 
             let audioData = recorder.stop()
+            activeRecordingKind = nil
 
             guard let data = audioData, data.count > 1000 else {
                 state.statusText = "Recording too short, try again"
@@ -462,11 +465,6 @@ enum TranscriptionStage: Equatable {
     case error(String)
 }
 
-enum RecordingMode: Int {
-    case toggle = 0
-    case pushToTalk = 1
-}
-
 final class AppState {
     var onChange: (() -> Void)?
 
@@ -474,13 +472,6 @@ final class AppState {
     var statusText = "" { didSet { onChange?() } }
     var lastTranscription = "" { didSet { onChange?() } }
     var transcriptionStage: TranscriptionStage = .idle { didSet { onChange?() } }
-    var recordingMode: RecordingMode {
-        get { RecordingMode(rawValue: UserDefaults.standard.integer(forKey: "recordingMode")) ?? .toggle }
-        set {
-            UserDefaults.standard.set(newValue.rawValue, forKey: "recordingMode")
-            onChange?()
-        }
-    }
 }
 
 // MARK: - Audio Recorder
@@ -828,6 +819,7 @@ enum AppError: LocalizedError {
     case sessionNotReady
     case transcriptionFailed(String)
     case hotKeyUnsupported
+    case hotKeyConflict
     case recordingFailed
 
     var errorDescription: String? {
@@ -841,7 +833,9 @@ enum AppError: LocalizedError {
         case .transcriptionFailed(let msg):
             return "Transcription failed: \(msg)"
         case .hotKeyUnsupported:
-            return "Use a shortcut with Command, Control, Option, or Shift."
+            return "Use a shortcut with ⌘, ⌃, ⌥, or ⇧."
+        case .hotKeyConflict:
+            return "Toggle and hold shortcuts must be different."
         case .recordingFailed:
             return "Failed to capture audio."
         }
@@ -907,12 +901,17 @@ final class PopoverViewController: NSViewController {
     private let state: AppState
     private let hotKeyManager: HotKeyManager
     private let statusLabel = NSTextField(labelWithString: "")
-    private let shortcutButton = NSButton(title: "", target: nil, action: nil)
+    private let toggleShortcutButton = NSButton(title: "", target: nil, action: nil)
+    private let holdShortcutButton = NSButton(title: "", target: nil, action: nil)
     private let transcriptLabel = NSTextField(labelWithString: "No recent transcription")
     private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
-    private let modeControl = NSSegmentedControl(labels: ["Toggle", "Hold"], trackingMode: .selectOne, target: nil, action: nil)
     private let loadingIndicator = NSProgressIndicator()
     private var shortcutMonitor: Any?
+    private var shortcutCaptureTarget: HotKeyKind?
+    private var shortcutCaptureKeyCode: UInt32?
+    private var shortcutCaptureModifiers: UInt32 = 0
+    private var shortcutCaptureCurrentModifiers: UInt32 = 0
+    private var shortcutCapturePressedKeyCodes = Set<UInt16>()
 
     init(state: AppState, hotKeyManager: HotKeyManager) {
         self.state = state
@@ -991,14 +990,13 @@ final class PopoverViewController: NSViewController {
         root.addArrangedSubview(divider())
 
         root.addArrangedSubview(sectionLabel("Settings"))
-        shortcutButton.target = self
-        shortcutButton.action = #selector(captureShortcut)
-        root.addArrangedSubview(menuRow(symbol: "keyboard", title: "Shortcut", trailing: shortcutButton))
+        holdShortcutButton.target = self
+        holdShortcutButton.action = #selector(captureHoldShortcut)
+        root.addArrangedSubview(menuRow(symbol: "keyboard.badge.ellipsis", title: "Hold shortcut", trailing: holdShortcutButton))
 
-        modeControl.target = self
-        modeControl.action = #selector(modeChanged)
-        modeControl.segmentStyle = .rounded
-        root.addArrangedSubview(menuRow(symbol: "switch.2", title: "Record mode", trailing: modeControl))
+        toggleShortcutButton.target = self
+        toggleShortcutButton.action = #selector(captureToggleShortcut)
+        root.addArrangedSubview(menuRow(symbol: "keyboard", title: "Toggle shortcut", trailing: toggleShortcutButton))
         root.addArrangedSubview(spacer(height: 8))
 
         root.addArrangedSubview(divider())
@@ -1139,8 +1137,18 @@ final class PopoverViewController: NSViewController {
         guard isViewLoaded else { return }
         DispatchQueue.main.async {
             self.statusLabel.stringValue = self.state.statusText.isEmpty ? "Ready" : self.state.statusText
-            self.shortcutButton.title = self.hotKeyManager.shortcutDisplay
-            self.modeControl.selectedSegment = self.state.recordingMode.rawValue
+            if self.shortcutCaptureTarget == nil {
+                self.holdShortcutButton.title = self.hotKeyManager.holdShortcutDisplay
+                self.toggleShortcutButton.title = self.hotKeyManager.toggleShortcutDisplay
+            } else {
+                if self.shortcutCaptureTarget != .hold {
+                    self.holdShortcutButton.title = self.hotKeyManager.holdShortcutDisplay
+                }
+                if self.shortcutCaptureTarget != .toggle {
+                    self.toggleShortcutButton.title = self.hotKeyManager.toggleShortcutDisplay
+                }
+                self.updateShortcutCaptureDisplay()
+            }
 
             switch self.state.transcriptionStage {
             case .recording:
@@ -1172,43 +1180,117 @@ final class PopoverViewController: NSViewController {
         state.statusText = "Copied latest transcription"
     }
 
-    @objc private func modeChanged() {
-        state.recordingMode = modeControl.selectedSegment == RecordingMode.pushToTalk.rawValue ? .pushToTalk : .toggle
-        state.statusText = state.recordingMode == .pushToTalk ? "Push-to-talk: hold shortcut to record" : "Toggle: press once to start, again to stop"
+    @objc private func captureToggleShortcut() {
+        captureShortcut(for: .toggle)
     }
 
-    @objc private func captureShortcut() {
+    @objc private func captureHoldShortcut() {
+        captureShortcut(for: .hold)
+    }
+
+    private func captureShortcut(for target: HotKeyKind) {
         guard shortcutMonitor == nil else { return }
-        hotKeyManager.suspendShortcut()
-        shortcutButton.title = "Press keys…"
-        state.statusText = "Press new shortcut…"
-        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        shortcutCaptureTarget = target
+        shortcutCaptureKeyCode = nil
+        shortcutCaptureModifiers = 0
+        shortcutCaptureCurrentModifiers = 0
+        shortcutCapturePressedKeyCodes.removeAll()
+        hotKeyManager.suspendShortcuts()
+        state.statusText = "Press new \(target.label.lowercased()) shortcut…"
+        updateShortcutCaptureDisplay()
+        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
             guard let self else { return event }
-            self.stopShortcutCapture(event: event)
-            return nil
+            return self.handleShortcutCapture(event: event)
         }
     }
 
-    private func stopShortcutCapture(event: NSEvent) {
+    private func handleShortcutCapture(event: NSEvent) -> NSEvent? {
+        guard shortcutCaptureTarget != nil else { return event }
+
+        shortcutCaptureCurrentModifiers = hotKeyManager.modifiers(from: event.modifierFlags)
+
+        if event.type == .keyDown, event.keyCode == UInt16(kVK_Escape) {
+            finishShortcutCapture(save: false)
+            return nil
+        }
+
+        switch event.type {
+        case .flagsChanged:
+            if shortcutCaptureKeyCode == nil {
+                shortcutCaptureModifiers = shortcutCaptureCurrentModifiers
+            }
+            updateShortcutCaptureDisplay()
+            finishShortcutCaptureIfReleased()
+        case .keyDown:
+            guard !event.isARepeat else { return nil }
+            shortcutCapturePressedKeyCodes.insert(event.keyCode)
+            shortcutCaptureKeyCode = UInt32(event.keyCode)
+            if shortcutCaptureCurrentModifiers != 0 {
+                shortcutCaptureModifiers = shortcutCaptureCurrentModifiers
+            }
+            updateShortcutCaptureDisplay()
+        case .keyUp:
+            shortcutCapturePressedKeyCodes.remove(event.keyCode)
+            finishShortcutCaptureIfReleased()
+        default:
+            break
+        }
+
+        return nil
+    }
+
+    private func finishShortcutCaptureIfReleased() {
+        guard shortcutCaptureKeyCode != nil,
+              shortcutCapturePressedKeyCodes.isEmpty,
+              shortcutCaptureCurrentModifiers == 0 else { return }
+        finishShortcutCapture(save: true)
+    }
+
+    private func finishShortcutCapture(save: Bool) {
         if let shortcutMonitor {
             NSEvent.removeMonitor(shortcutMonitor)
             self.shortcutMonitor = nil
         }
-        if event.keyCode == UInt16(kVK_Escape) {
-            hotKeyManager.registerSavedShortcut()
+        guard let target = shortcutCaptureTarget else { return }
+        let keyCode = shortcutCaptureKeyCode
+        let modifiers = shortcutCaptureModifiers
+        shortcutCaptureTarget = nil
+        shortcutCaptureKeyCode = nil
+        shortcutCaptureModifiers = 0
+        shortcutCaptureCurrentModifiers = 0
+        shortcutCapturePressedKeyCodes.removeAll()
+
+        guard save, let keyCode else {
+            hotKeyManager.registerSavedShortcuts()
             state.statusText = "Shortcut unchanged"
             refresh()
             return
         }
 
         do {
-            try hotKeyManager.updateShortcut(from: event)
-            state.statusText = "Shortcut saved"
+            try hotKeyManager.updateShortcut(for: target, keyCode: keyCode, modifiers: modifiers)
+            state.statusText = "\(target.label) shortcut saved"
         } catch {
-            hotKeyManager.registerSavedShortcut()
+            hotKeyManager.registerSavedShortcuts()
             state.statusText = "Shortcut failed: \(error.localizedDescription)"
         }
         refresh()
+    }
+
+    private func updateShortcutCaptureDisplay() {
+        guard let target = shortcutCaptureTarget else { return }
+        let keyCode = shortcutCaptureKeyCode
+        let modifiers = keyCode == nil ? shortcutCaptureCurrentModifiers : shortcutCaptureModifiers
+        captureButton(for: target).title = hotKeyManager.displayShortcut(modifiers: modifiers, keyCode: keyCode)
+    }
+
+    private func captureButton(for target: HotKeyKind) -> NSButton {
+        switch target {
+        case .toggle:
+            return toggleShortcutButton
+        case .hold:
+            return holdShortcutButton
+        }
     }
 
     @objc private func quitApp() {
@@ -1218,72 +1300,153 @@ final class PopoverViewController: NSViewController {
 
 // MARK: - HotKey Manager
 
+enum HotKeyKind: UInt32, CaseIterable {
+    case toggle = 1
+    case hold = 2
+
+    var label: String {
+        switch self {
+        case .toggle: return "Toggle"
+        case .hold: return "Hold"
+        }
+    }
+
+    var keyCodeDefaultsKey: String {
+        switch self {
+        case .toggle: return "toggleHotKeyCode"
+        case .hold: return "holdHotKeyCode"
+        }
+    }
+
+    var modifiersDefaultsKey: String {
+        switch self {
+        case .toggle: return "toggleHotKeyModifiers"
+        case .hold: return "holdHotKeyModifiers"
+        }
+    }
+
+    var fallbackKeyCode: Int {
+        switch self {
+        case .toggle: return kVK_ANSI_M
+        case .hold: return kVK_ANSI_M
+        }
+    }
+
+    var fallbackModifiers: Int {
+        switch self {
+        case .toggle: return cmdKey | shiftKey
+        case .hold: return controlKey | optionKey
+        }
+    }
+}
+
 final class HotKeyManager {
+    private static let signature = OSType(0x57524548) // WREH
+
     private let state: AppState
-    private let onPressed: () -> Void
-    private let onReleased: () -> Void
-    private var hotKeyRef: EventHotKeyRef?
+    private let onTogglePressed: () -> Void
+    private let onHoldPressed: () -> Void
+    private let onHoldReleased: () -> Void
+    private var toggleHotKeyRef: EventHotKeyRef?
+    private var holdHotKeyRef: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
 
-    init(state: AppState, onPressed: @escaping () -> Void, onReleased: @escaping () -> Void) {
+    init(
+        state: AppState,
+        onTogglePressed: @escaping () -> Void,
+        onHoldPressed: @escaping () -> Void,
+        onHoldReleased: @escaping () -> Void
+    ) {
         self.state = state
-        self.onPressed = onPressed
-        self.onReleased = onReleased
+        self.onTogglePressed = onTogglePressed
+        self.onHoldPressed = onHoldPressed
+        self.onHoldReleased = onHoldReleased
         installEventHandler()
     }
 
     deinit {
-        unregister()
+        unregisterAll()
         if let eventHandler {
             RemoveEventHandler(eventHandler)
         }
     }
 
-    var shortcutDisplay: String {
-        let savedKey = UserDefaults.standard.object(forKey: "hotKeyCode") as? Int
-        let savedModifiers = UserDefaults.standard.object(forKey: "hotKeyModifiers") as? Int
-        let keyCode = UInt32(savedKey ?? kVK_ANSI_M)
-        let modifiers = UInt32(savedModifiers ?? (cmdKey | shiftKey))
-        return display(modifiers: modifiers, keyCode: keyCode)
+    var toggleShortcutDisplay: String { display(shortcut(for: .toggle)) }
+    var holdShortcutDisplay: String { display(shortcut(for: .hold)) }
+
+    func registerSavedShortcuts() {
+        registerAll(updateStatus: true)
     }
 
-    func registerSavedShortcut() {
-        let keyCode = UInt32(UserDefaults.standard.object(forKey: "hotKeyCode") as? Int ?? kVK_ANSI_M)
-        let modifiers = UInt32(UserDefaults.standard.object(forKey: "hotKeyModifiers") as? Int ?? (cmdKey | shiftKey))
-        register(keyCode: keyCode, modifiers: modifiers)
+    func suspendShortcuts() {
+        unregisterAll()
     }
 
-    func suspendShortcut() {
-        unregister()
-    }
-
-    func updateShortcut(from event: NSEvent) throws {
-        let modifiers = carbonModifiers(from: event.modifierFlags)
+    func updateShortcut(for kind: HotKeyKind, keyCode: UInt32, modifiers: UInt32) throws {
         guard modifiers != 0 else { throw AppError.hotKeyUnsupported }
-        let keyCode = UInt32(event.keyCode)
-        UserDefaults.standard.set(Int(keyCode), forKey: "hotKeyCode")
-        UserDefaults.standard.set(Int(modifiers), forKey: "hotKeyModifiers")
-        register(keyCode: keyCode, modifiers: modifiers)
+        let otherKind: HotKeyKind = kind == .toggle ? .hold : .toggle
+        let other = shortcut(for: otherKind)
+        guard other.keyCode != keyCode || other.modifiers != modifiers else { throw AppError.hotKeyConflict }
+
+        UserDefaults.standard.set(Int(keyCode), forKey: kind.keyCodeDefaultsKey)
+        UserDefaults.standard.set(Int(modifiers), forKey: kind.modifiersDefaultsKey)
+        registerAll(updateStatus: false)
     }
 
-    private func register(keyCode: UInt32, modifiers: UInt32) {
-        unregister()
-        let hotKeyID = EventHotKeyID(signature: OSType(0x54524E53), id: 1)
+    func modifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
+        carbonModifiers(from: flags)
+    }
+
+    func displayShortcut(modifiers: UInt32, keyCode: UInt32?) -> String {
+        display(modifiers: modifiers, keyCode: keyCode)
+    }
+
+    private func registerAll(updateStatus: Bool) {
+        unregisterAll()
+        let toggleStatus = register(kind: .toggle)
+        let holdStatus = register(kind: .hold)
+
+        guard updateStatus else { return }
+        if toggleStatus == noErr && holdStatus == noErr {
+            state.statusText = "Shortcuts: toggle \(toggleShortcutDisplay), hold \(holdShortcutDisplay)"
+        } else if toggleStatus != noErr {
+            state.statusText = "Toggle shortcut registration failed: \(toggleStatus)"
+        } else {
+            state.statusText = "Hold shortcut registration failed: \(holdStatus)"
+        }
+    }
+
+    private func register(kind: HotKeyKind) -> OSStatus {
+        let shortcut = shortcut(for: kind)
+        let hotKeyID = EventHotKeyID(signature: Self.signature, id: kind.rawValue)
+        var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(
-            keyCode,
-            modifiers,
+            shortcut.keyCode,
+            shortcut.modifiers,
             hotKeyID,
             GetApplicationEventTarget(),
             0,
-            &hotKeyRef
+            &ref
         )
-        state.statusText = status == noErr ? "Shortcut: \(display(modifiers: modifiers, keyCode: keyCode))" : "Shortcut registration failed: \(status)"
+        if status == noErr {
+            switch kind {
+            case .toggle:
+                toggleHotKeyRef = ref
+            case .hold:
+                holdHotKeyRef = ref
+            }
+        }
+        return status
     }
 
-    private func unregister() {
-        if let hotKeyRef {
-            UnregisterEventHotKey(hotKeyRef)
-            self.hotKeyRef = nil
+    private func unregisterAll() {
+        if let toggleHotKeyRef {
+            UnregisterEventHotKey(toggleHotKeyRef)
+            self.toggleHotKeyRef = nil
+        }
+        if let holdHotKeyRef {
+            UnregisterEventHotKey(holdHotKeyRef)
+            self.holdHotKeyRef = nil
         }
     }
 
@@ -1296,16 +1459,44 @@ final class HotKeyManager {
         InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
             guard let userData, let event else { return noErr }
             let manager = Unmanaged<HotKeyManager>.fromOpaque(userData).takeUnretainedValue()
-            switch GetEventKind(event) {
-            case UInt32(kEventHotKeyPressed):
-                manager.onPressed()
-            case UInt32(kEventHotKeyReleased):
-                manager.onReleased()
+            guard let kind = manager.hotKeyKind(from: event) else { return noErr }
+
+            switch (kind, GetEventKind(event)) {
+            case (.toggle, UInt32(kEventHotKeyPressed)):
+                manager.onTogglePressed()
+            case (.hold, UInt32(kEventHotKeyPressed)):
+                manager.onHoldPressed()
+            case (.hold, UInt32(kEventHotKeyReleased)):
+                manager.onHoldReleased()
             default:
                 break
             }
             return noErr
         }, eventTypes.count, &eventTypes, pointer, &eventHandler)
+    }
+
+    private func hotKeyKind(from event: EventRef) -> HotKeyKind? {
+        var hotKeyID = EventHotKeyID()
+        let status = GetEventParameter(
+            event,
+            EventParamName(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotKeyID
+        )
+        guard status == noErr, hotKeyID.signature == Self.signature else { return nil }
+        return HotKeyKind(rawValue: hotKeyID.id)
+    }
+
+    private func shortcut(for kind: HotKeyKind) -> (keyCode: UInt32, modifiers: UInt32) {
+        let defaults = UserDefaults.standard
+        let legacyKey = kind == .toggle ? defaults.object(forKey: "hotKeyCode") as? Int : nil
+        let legacyModifiers = kind == .toggle ? defaults.object(forKey: "hotKeyModifiers") as? Int : nil
+        let keyCode = defaults.object(forKey: kind.keyCodeDefaultsKey) as? Int ?? legacyKey ?? kind.fallbackKeyCode
+        let modifiers = defaults.object(forKey: kind.modifiersDefaultsKey) as? Int ?? legacyModifiers ?? kind.fallbackModifiers
+        return (UInt32(keyCode), UInt32(modifiers))
     }
 
     private func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
@@ -1317,14 +1508,20 @@ final class HotKeyManager {
         return result
     }
 
-    private func display(modifiers: UInt32, keyCode: UInt32) -> String {
+    private func display(_ shortcut: (keyCode: UInt32, modifiers: UInt32)) -> String {
+        display(modifiers: shortcut.modifiers, keyCode: shortcut.keyCode)
+    }
+
+    private func display(modifiers: UInt32, keyCode: UInt32?) -> String {
         var parts: [String] = []
-        if modifiers & UInt32(controlKey) != 0 { parts.append("Control") }
-        if modifiers & UInt32(optionKey) != 0 { parts.append("Option") }
-        if modifiers & UInt32(shiftKey) != 0 { parts.append("Shift") }
-        if modifiers & UInt32(cmdKey) != 0 { parts.append("Command") }
-        parts.append(keyName(for: keyCode))
-        return parts.joined(separator: "-")
+        if modifiers & UInt32(controlKey) != 0 { parts.append("⌃") }
+        if modifiers & UInt32(optionKey) != 0 { parts.append("⌥") }
+        if modifiers & UInt32(shiftKey) != 0 { parts.append("⇧") }
+        if modifiers & UInt32(cmdKey) != 0 { parts.append("⌘") }
+        if let keyCode {
+            parts.append(keyName(for: keyCode))
+        }
+        return parts.isEmpty ? "Listening…" : parts.joined()
     }
 
     private func keyName(for keyCode: UInt32) -> String {
