@@ -49,7 +49,7 @@ PLIST
 if [[ "$needs_build" == "1" ]]; then
   echo "Building wire…"
   find "$ROOT/.build" -path '*/release/ModuleCache' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-  swift build -c release --package-path "$ROOT"
+  swift build --disable-sandbox -c release --package-path "$ROOT"
   package_app
 else
   sign_app "$APP"

@@ -2,6 +2,10 @@ import AppKit
 import Carbon
 import WebKit
 import AVFoundation
+import CoreAudio
+import AudioToolbox
+import IOKit.hid
+import MediaPlayer
 import ApplicationServices
 import ServiceManagement
 
@@ -57,25 +61,42 @@ enum LaunchAtLogin {
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let sendEnterAfterPasteDefaultsKey = "sendEnterAfterPaste"
+    private static let headsetControlsEnabledDefaultsKey = "headsetControlsEnabled"
+
     private let state = AppState()
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var hotKeyManager: HotKeyManager!
+    private var headsetProbeManager: HeadsetProbeManager!
     private var codexClient: CodexAPIClient!
     private var recorder: AudioRecorder!
     private var statusSpinnerTimer: Timer?
     private var recordingStatusTimer: Timer?
+    private var popoverOutsideClickMonitors: [Any] = []
     private var recordingStartedAt: Date?
+    private var activeRecordingShouldPressReturn = false
+    private var activeRecordingStartedByAirPods = false
     private var statusSpinnerIndex = 0
     private var activeRecordingKind: HotKeyKind?
     private let statusSpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        state.sendEnterAfterPaste = UserDefaults.standard.bool(forKey: Self.sendEnterAfterPasteDefaultsKey)
+        state.headsetControlsEnabled = (UserDefaults.standard.object(forKey: Self.headsetControlsEnabledDefaultsKey) as? Bool) ?? true
 
         // Initialize components
         codexClient = CodexAPIClient()
         recorder = AudioRecorder()
+        headsetProbeManager = HeadsetProbeManager(
+            state: state,
+            onTogglePressed: { [weak self] in self?.handleHeadsetTogglePressed() },
+            onAirPodsTogglePressed: { [weak self] in self?.handleAirPodsTogglePressed() },
+            onHoldPressed: { [weak self] in self?.handleHeadsetHoldPressed() },
+            onHoldReleased: { [weak self] in self?.handleHeadsetHoldReleased() },
+            isRecording: { [weak self] in self?.recorder.hasActiveRecording ?? false }
+        )
         hotKeyManager = HotKeyManager(
             state: state,
             onTogglePressed: { [weak self] in self?.handleToggleHotKeyPressed() },
@@ -98,11 +119,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Setup popover
         let controller = PopoverViewController(
             state: state,
-            hotKeyManager: hotKeyManager
+            hotKeyManager: hotKeyManager,
+            headsetProbeManager: headsetProbeManager
         )
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 300, height: 272)
+        popover.contentSize = NSSize(width: 300, height: 386)
         popover.contentViewController = controller
 
         state.onChange = { [weak self, weak controller] in
@@ -110,6 +132,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             controller?.refresh()
         }
         hotKeyManager.registerSavedShortcuts()
+        headsetProbeManager.restoreSavedState()
+        headsetProbeManager.setControlsEnabled(state.headsetControlsEnabled)
         if SMAppService.mainApp.status == .notRegistered {
             try? LaunchAtLogin.setEnabled(true)
         }
@@ -119,6 +143,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Pre-warm the API client and check auth
         Task {
             await initializeSession()
+        }
+        runAirPodsCaptureSelfTestIfRequested()
+    }
+
+    private func runAirPodsCaptureSelfTestIfRequested() {
+        guard let rawSeconds = ProcessInfo.processInfo.environment["WIRE_SELF_TEST_AIRPODS_CAPTURE_SECONDS"],
+              let seconds = Double(rawSeconds) else { return }
+        let outputURL = URL(fileURLWithPath: "/tmp/wire-airpods-capture-self-test.txt")
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            handleAirPodsTogglePressed()
+
+            let startDeadline = Date().addingTimeInterval(3)
+            while !recorder.hasActiveRecording && Date() < startDeadline {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+
+            guard recorder.hasActiveRecording else {
+                try? "started=false\nstatus=\(state.statusText)\n".write(to: outputURL, atomically: true, encoding: .utf8)
+                NSApp.terminate(nil)
+                return
+            }
+
+            try? await Task.sleep(nanoseconds: UInt64(max(0.2, seconds) * 1_000_000_000))
+            let data = recorder.stop()
+            stopRecordingStatusTimer()
+            activeRecordingKind = nil
+            activeRecordingShouldPressReturn = false
+            activeRecordingStartedByAirPods = false
+            state.isBusy = false
+            state.transcriptionStage = .idle
+
+            let summary: String
+            if let data, let stats = wavStats(data) {
+                summary = """
+                started=true
+                bytes=\(data.count)
+                duration=\(String(format: "%.3f", stats.duration))
+                rms=\(String(format: "%.1f", stats.rms))
+                peak=\(stats.peak)
+
+                """
+            } else {
+                summary = "started=true\nbytes=\(data?.count ?? 0)\nduration=0.000\nrms=0.0\npeak=0\n"
+            }
+            try? summary.write(to: outputURL, atomically: true, encoding: .utf8)
+            NSApp.terminate(nil)
         }
     }
 
@@ -151,24 +223,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
-            popover.performClose(nil)
+            closePopover()
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
+            DispatchQueue.main.async { [weak self] in
+                self?.popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil)
+            }
+            installPopoverOutsideClickMonitor()
+        }
+    }
+
+    private func closePopover() {
+        popover.performClose(nil)
+        removePopoverOutsideClickMonitor()
+    }
+
+    private func installPopoverOutsideClickMonitor() {
+        removePopoverOutsideClickMonitor()
+        let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.closePopoverIfMouseIsOutside()
+            }
+        }
+        let localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            self?.closePopoverIfMouseIsOutside()
+            return event
+        }
+        popoverOutsideClickMonitors = [globalMonitor, localMonitor].compactMap { $0 }
+    }
+
+    private func removePopoverOutsideClickMonitor() {
+        for monitor in popoverOutsideClickMonitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        popoverOutsideClickMonitors.removeAll()
+    }
+
+    private func closePopoverIfMouseIsOutside() {
+        guard popover.isShown else {
+            removePopoverOutsideClickMonitor()
+            return
+        }
+        guard let popoverWindow = popover.contentViewController?.view.window else {
+            closePopover()
+            return
+        }
+        let screenPoint = NSEvent.mouseLocation
+        guard popoverWindow.frame.contains(screenPoint) else {
+            closePopover()
+            return
         }
     }
 
     private func renderStatusItem() {
         DispatchQueue.main.async {
             let isTranscribing = self.state.transcriptionStage == .transcribing
-            if let image = NSImage(systemSymbolName: self.recorder.isRecording ? "mic.circle.fill" : "mic.fill", accessibilityDescription: "wire") {
+            if let image = NSImage(systemSymbolName: self.recorder.hasActiveRecording ? "mic.circle.fill" : "mic.fill", accessibilityDescription: "wire") {
                 image.isTemplate = true
                 self.statusItem.button?.image = image
                 self.statusItem.button?.imagePosition = .imageLeft
             }
             if isTranscribing {
                 self.startStatusSpinner()
-            } else if self.recorder.isRecording {
+            } else if self.recorder.hasActiveRecording {
                 self.stopStatusSpinner()
                 self.updateRecordingStatusTitle()
             } else {
@@ -225,26 +343,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         handleTranscribe()
     }
 
+    private func handleHeadsetTogglePressed() {
+        handleTranscribe(sendReturnAfterPasteEligible: true)
+    }
+
+    private func handleAirPodsTogglePressed() {
+        handleTranscribe(useBuiltInInput: true, sendReturnAfterPasteEligible: true, startedByAirPods: true)
+    }
+
     private func handleHoldHotKeyPressed() {
         startRecording(status: "Recording… release hold shortcut to transcribe", kind: .hold)
     }
 
+    private func handleHeadsetHoldPressed() {
+        startRecording(status: "Recording… release headset button to transcribe", kind: .hold, sendReturnAfterPasteEligible: true)
+    }
+
     private func handleHoldHotKeyReleased() {
-        guard recorder.isRecording, activeRecordingKind == .hold else { return }
+        guard recorder.hasActiveRecording, activeRecordingKind == .hold else { return }
         stopAndTranscribe()
     }
 
-    private func handleTranscribe() {
-        if recorder.isRecording {
+    private func handleHeadsetHoldReleased() {
+        handleHoldHotKeyReleased()
+    }
+
+    private func handleTranscribe(
+        useBuiltInInput: Bool = false,
+        sendReturnAfterPasteEligible: Bool = false,
+        startedByAirPods: Bool = false
+    ) {
+        if recorder.hasActiveRecording {
             stopAndTranscribe()
         } else {
-            startRecording(status: "Recording… press toggle shortcut again to stop", kind: .toggle)
+            startRecording(
+                status: "Recording… press toggle shortcut again to stop",
+                kind: .toggle,
+                useBuiltInInput: useBuiltInInput,
+                sendReturnAfterPasteEligible: sendReturnAfterPasteEligible,
+                startedByAirPods: startedByAirPods
+            )
         }
     }
 
-    private func startRecording(status: String, kind: HotKeyKind) {
+    private func startRecording(
+        status: String,
+        kind: HotKeyKind,
+        useBuiltInInput: Bool = false,
+        sendReturnAfterPasteEligible: Bool = false,
+        startedByAirPods: Bool = false
+    ) {
         Task { @MainActor in
-            guard !recorder.isRecording else { return }
+            guard !recorder.hasActiveRecording else { return }
             guard state.transcriptionStage != .transcribing else { return }
 
             guard await ensureMicrophonePermission() else {
@@ -260,9 +410,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.statusText = status
             state.isBusy = true
 
+            var inputDeviceID: AudioDeviceID?
             do {
-                try recorder.start()
+                if useBuiltInInput {
+                    inputDeviceID = try DefaultAudioInputOverride.builtInInputDeviceID()
+                }
+                try recorder.start(inputDeviceID: inputDeviceID)
                 activeRecordingKind = kind
+                activeRecordingShouldPressReturn = sendReturnAfterPasteEligible
+                activeRecordingStartedByAirPods = startedByAirPods
                 startRecordingStatusTimer()
             } catch {
                 state.statusText = "Could not start recording: \(error.localizedDescription)"
@@ -274,13 +430,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func stopAndTranscribe() {
         Task { @MainActor in
-            guard recorder.isRecording else { return }
+            guard recorder.hasActiveRecording else { return }
             state.statusText = "Loading… transcribing"
             state.transcriptionStage = .transcribing
 
             let audioData = recorder.stop()
+            let shouldPressReturnAfterPaste = activeRecordingShouldPressReturn && state.sendEnterAfterPaste
+            let wasStartedByAirPods = activeRecordingStartedByAirPods
             stopRecordingStatusTimer()
             activeRecordingKind = nil
+            activeRecordingShouldPressReturn = false
+            activeRecordingStartedByAirPods = false
 
             guard let data = audioData, data.count > 1000 else {
                 state.statusText = "Recording too short, try again"
@@ -289,7 +449,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
-            guard isLikelySpeechRecording(data) else {
+            guard hasCapturedAudio(data) else {
+                state.statusText = "No microphone audio captured"
+                state.transcriptionStage = .error("No microphone audio captured")
+                state.isBusy = false
+                return
+            }
+
+            guard wasStartedByAirPods || isLikelySpeechRecording(data) else {
                 state.statusText = "Ready"
                 state.transcriptionStage = .idle
                 state.isBusy = false
@@ -299,7 +466,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.statusText = "Loading… uploading \(data.count / 1024) KB"
 
             do {
-                let text = try await codexClient.transcribe(audioData: data)
+                let text = try await transcribe(data, retryASRFailure: wasStartedByAirPods)
 
                 state.lastTranscription = text
                 state.transcriptionStage = .done
@@ -309,13 +476,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 pasteboard.clearContents()
                 pasteboard.setString(text, forType: .string)
 
-                typeText(text)
+                typeText(text, pressReturnAfterPaste: shouldPressReturnAfterPaste)
             } catch {
-                state.statusText = "Error: \(error.localizedDescription)"
-                state.transcriptionStage = .error(error.localizedDescription)
+                if isASRBackendFailure(error) {
+                    state.statusText = "Error: speech recognition failed. Try again."
+                    state.transcriptionStage = .error("Speech recognition failed")
+                } else {
+                    state.statusText = "Error: \(error.localizedDescription)"
+                    state.transcriptionStage = .error(error.localizedDescription)
+                }
             }
             state.isBusy = false
         }
+    }
+
+    private func transcribe(_ data: Data, retryASRFailure: Bool) async throws -> String {
+        do {
+            return try await codexClient.transcribe(audioData: data)
+        } catch {
+            guard retryASRFailure, isASRBackendFailure(error) else {
+                throw error
+            }
+            await MainActor.run {
+                state.statusText = "Speech recognition failed, retrying..."
+            }
+            try await Task.sleep(nanoseconds: 800_000_000)
+            return try await codexClient.transcribe(audioData: data)
+        }
+    }
+
+    private func isASRBackendFailure(_ error: Error) -> Bool {
+        guard case AppError.transcriptionFailed(let message) = error else { return false }
+        return message.contains("HTTP 500") && message.localizedCaseInsensitiveContains("ASR")
     }
 
     @discardableResult
@@ -410,6 +602,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    private func hasCapturedAudio(_ data: Data) -> Bool {
+        guard let stats = wavStats(data) else {
+            return data.count > 18_000
+        }
+        return stats.duration > 0.1
+    }
+
     private func wavStats(_ data: Data) -> (duration: Double, rms: Double, peak: Int)? {
         guard data.count > 44 else { return nil }
         let bytes = [UInt8](data)
@@ -465,7 +664,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return (duration, rms, peak)
     }
 
-    private func typeText(_ text: String) {
+    private func typeText(_ text: String, pressReturnAfterPaste: Bool) {
         guard requestAccessibilityPermission(prompt: false) else {
             state.statusText = "Enable Accessibility permission for wire to paste"
             openAccessibilitySettings()
@@ -484,6 +683,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let up = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: false)
         down?.flags = .maskCommand
         up?.flags = .maskCommand
+        down?.post(tap: .cghidEventTap)
+        up?.post(tap: .cghidEventTap)
+
+        if pressReturnAfterPaste {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+                self?.pressReturnKey()
+            }
+        }
+    }
+
+    func setHeadsetControlsEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.headsetControlsEnabledDefaultsKey)
+        state.headsetControlsEnabled = enabled
+        headsetProbeManager.setControlsEnabled(enabled)
+        state.statusText = enabled ? "Headset controls enabled" : "Headset controls disabled"
+    }
+
+    func setSendEnterAfterPaste(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.sendEnterAfterPasteDefaultsKey)
+        state.sendEnterAfterPaste = enabled
+        state.statusText = enabled ? "Headset recordings will press Return after pasting" : "Return after paste disabled"
+    }
+
+    private func pressReturnKey() {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let returnKey = CGKeyCode(kVK_Return)
+        let down = CGEvent(keyboardEventSource: source, virtualKey: returnKey, keyDown: true)
+        let up = CGEvent(keyboardEventSource: source, virtualKey: returnKey, keyDown: false)
         down?.post(tap: .cghidEventTap)
         up?.post(tap: .cghidEventTap)
     }
@@ -506,20 +733,642 @@ final class AppState {
     var statusText = "" { didSet { onChange?() } }
     var lastTranscription = "" { didSet { onChange?() } }
     var transcriptionStage: TranscriptionStage = .idle { didSet { onChange?() } }
+    var sendEnterAfterPaste = false { didSet { onChange?() } }
+    var headsetControlsEnabled = true { didSet { onChange?() } }
+}
+
+// MARK: - Headset Controls
+
+final class DefaultAudioInputOverride {
+    private let previousDeviceID: AudioDeviceID
+    private let replacementDeviceID: AudioDeviceID
+    var activeDeviceID: AudioDeviceID { replacementDeviceID }
+
+    private init(previousDeviceID: AudioDeviceID, replacementDeviceID: AudioDeviceID) {
+        self.previousDeviceID = previousDeviceID
+        self.replacementDeviceID = replacementDeviceID
+    }
+
+    static func activateBuiltInInput() throws -> DefaultAudioInputOverride {
+        guard let previous = defaultInputDeviceID() else {
+            throw AppError.transcriptionFailed("Could not read current input device")
+        }
+        let builtIn = try builtInInputDeviceID()
+        guard previous != builtIn else {
+            return DefaultAudioInputOverride(previousDeviceID: previous, replacementDeviceID: builtIn)
+        }
+        try setDefaultInputDeviceID(builtIn)
+        return DefaultAudioInputOverride(previousDeviceID: previous, replacementDeviceID: builtIn)
+    }
+
+    func restore() {
+        guard previousDeviceID != replacementDeviceID else { return }
+        try? Self.setDefaultInputDeviceID(previousDeviceID)
+    }
+
+    private static func defaultInputDeviceID() -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        return status == noErr ? deviceID : nil
+    }
+
+    private static func setDefaultInputDeviceID(_ deviceID: AudioDeviceID) throws {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var mutableDeviceID = deviceID
+        let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectSetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            size,
+            &mutableDeviceID
+        )
+        guard status == noErr else {
+            throw AppError.transcriptionFailed("Could not switch input device: \(status)")
+        }
+    }
+
+    static func builtInInputDeviceID() throws -> AudioDeviceID {
+        guard let deviceID = audioDeviceIDs().first(where: { deviceID in
+            audioStreamCount(deviceID, scope: kAudioDevicePropertyScopeInput) > 0
+                && isBuiltInInput(deviceID)
+        }) else {
+            throw AppError.transcriptionFailed("Could not find built-in Mac microphone")
+        }
+        return deviceID
+    }
+
+    static func builtInInputDeviceUID() throws -> String {
+        let deviceID = try builtInInputDeviceID()
+        guard let uid = audioDeviceUID(deviceID) else {
+            throw AppError.transcriptionFailed("Could not read Mac microphone device UID")
+        }
+        return uid
+    }
+
+    static func builtInInputDeviceName() throws -> String {
+        audioDeviceName(try builtInInputDeviceID()) ?? "Built-in Mac microphone"
+    }
+
+    private static func isBuiltInInput(_ deviceID: AudioDeviceID) -> Bool {
+        let name = (audioDeviceName(deviceID) ?? "").lowercased()
+        if name.contains("macbook") || name.contains("built-in") || name.contains("built in") {
+            return true
+        }
+        return audioTransport(deviceID) == kAudioDeviceTransportTypeBuiltIn
+    }
+
+    private static func audioDeviceIDs() -> [AudioDeviceID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr else {
+            return []
+        }
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var devices = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &devices) == noErr else {
+            return []
+        }
+        return devices
+    }
+
+    private static func audioDeviceName(_ deviceID: AudioDeviceID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var name: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &name)
+        guard status == noErr, let name else { return nil }
+        return name.takeUnretainedValue() as String
+    }
+
+    private static func audioDeviceUID(_ deviceID: AudioDeviceID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var uid: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &uid)
+        guard status == noErr, let uid else { return nil }
+        return uid.takeUnretainedValue() as String
+    }
+
+    private static func audioTransport(_ deviceID: AudioDeviceID) -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transport = UInt32(0)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport)
+        return status == noErr ? transport : 0
+    }
+
+    private static func audioStreamCount(_ deviceID: AudioDeviceID, scope: AudioObjectPropertyScope) -> Int {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size) == noErr else {
+            return 0
+        }
+        return Int(size) / MemoryLayout<AudioStreamID>.size
+    }
+}
+
+enum HeadsetButtonMode: Int, CaseIterable {
+    case longPressHold = 0
+    case longPressToggle = 1
+
+    var title: String {
+        switch self {
+        case .longPressHold: return "Long hold to dictate"
+        case .longPressToggle: return "Long press to toggle"
+        }
+    }
+
+    var statusText: String {
+        switch self {
+        case .longPressHold: return "Wired button: hold to dictate"
+        case .longPressToggle: return "Wired button: press to toggle"
+        }
+    }
+
+    var controlsWiredRecording: Bool { true }
+}
+
+final class HeadsetProbeManager {
+    private struct RemoteCommandTarget {
+        let command: MPRemoteCommand
+        let target: Any
+    }
+
+    private static let modeDefaultsKey = "headsetButtonMode"
+    private static let airPodsControlDefaultsKey = "airPodsMacMicControlEnabled"
+    private static let playPauseUsage: UInt32 = 0xcd
+    private static let nextTrackUsage: UInt32 = 0xb5
+    private static let longPressThreshold: TimeInterval = 0.45
+
+    private let state: AppState
+    private let onTogglePressed: () -> Void
+    private let onAirPodsTogglePressed: () -> Void
+    private let onHoldPressed: () -> Void
+    private let onHoldReleased: () -> Void
+    private let isRecording: () -> Bool
+    private var hidManager: IOHIDManager?
+    private var remoteCommandTargets: [RemoteCommandTarget] = []
+    private var airPodsProbeEngine: AVAudioEngine?
+    private var airPodsProbePlayer: AVAudioPlayerNode?
+    private var airPodsNowPlayingTimer: Timer?
+    private var mode: HeadsetButtonMode = .longPressHold
+    private var controlsEnabled = true
+    private var airPodsControlEnabled = false
+    private var lastAirPodsToggleAt: Date?
+    private var headsetPressStartedAt: Date?
+    private var longPressWorkItem: DispatchWorkItem?
+    private var longPressActive = false
+
+    private static func appendAirPodsDebugLog(_ message: String) {
+        let formatter = ISO8601DateFormatter()
+        let line = "\(formatter.string(from: Date())) \(message)\n"
+        let url = URL(fileURLWithPath: "/tmp/wire-airpods-remote.log")
+        guard let data = line.data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: url.path),
+           let handle = try? FileHandle(forWritingTo: url) {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    init(
+        state: AppState,
+        onTogglePressed: @escaping () -> Void,
+        onAirPodsTogglePressed: @escaping () -> Void,
+        onHoldPressed: @escaping () -> Void,
+        onHoldReleased: @escaping () -> Void,
+        isRecording: @escaping () -> Bool
+    ) {
+        self.state = state
+        self.onTogglePressed = onTogglePressed
+        self.onAirPodsTogglePressed = onAirPodsTogglePressed
+        self.onHoldPressed = onHoldPressed
+        self.onHoldReleased = onHoldReleased
+        self.isRecording = isRecording
+    }
+
+    deinit {
+        stop()
+    }
+
+    var currentMode: HeadsetButtonMode { mode }
+    var areControlsEnabled: Bool { controlsEnabled }
+    var isAirPodsControlEnabled: Bool { airPodsControlEnabled }
+
+    func restoreSavedState() {
+        let defaults = UserDefaults.standard
+        let rawMode = defaults.object(forKey: Self.modeDefaultsKey) as? Int
+        let migratedAirPodsEnabled = rawMode == 5
+        let savedMode: HeadsetButtonMode
+        switch rawMode {
+        case HeadsetButtonMode.longPressToggle.rawValue, 3:
+            savedMode = .longPressToggle
+        default:
+            savedMode = .longPressHold
+        }
+        let savedAirPodsEnabled = (defaults.object(forKey: Self.airPodsControlDefaultsKey) as? Bool) ?? migratedAirPodsEnabled
+
+        setMode(savedMode, persist: false)
+        setAirPodsControlEnabled(savedAirPodsEnabled, persist: false)
+    }
+
+    func setControlsEnabled(_ enabled: Bool) {
+        controlsEnabled = enabled
+        if enabled {
+            start()
+        } else {
+            stop()
+        }
+    }
+
+    func setMode(_ mode: HeadsetButtonMode) {
+        setMode(mode, persist: true)
+    }
+
+    func setAirPodsControlEnabled(_ enabled: Bool) {
+        setAirPodsControlEnabled(enabled, persist: true)
+    }
+
+    private func setMode(_ mode: HeadsetButtonMode, persist: Bool) {
+        if persist {
+            UserDefaults.standard.set(mode.rawValue, forKey: Self.modeDefaultsKey)
+        }
+        cancelPendingLongPress()
+        self.mode = mode
+        if controlsEnabled {
+            start()
+        }
+        state.statusText = mode.statusText
+    }
+
+    private func setAirPodsControlEnabled(_ enabled: Bool, persist: Bool) {
+        if persist {
+            UserDefaults.standard.set(enabled, forKey: Self.airPodsControlDefaultsKey)
+        }
+        airPodsControlEnabled = enabled
+        syncRemoteCommandProbe()
+        if persist {
+            state.statusText = enabled ? "Experimental AirPods enabled" : "Experimental AirPods disabled"
+        }
+    }
+
+    func start() {
+        guard controlsEnabled else { return }
+        installHIDControl()
+        syncRemoteCommandProbe()
+    }
+
+    func stop() {
+        cancelPendingLongPress()
+        removeRemoteCommandProbe()
+        removeHIDControl()
+    }
+
+    private func installHIDControl() {
+        guard hidManager == nil else { return }
+
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        let matches: [[String: Any]] = [
+            [
+                kIOHIDDeviceUsagePageKey as String: kHIDPage_Consumer
+            ],
+            [
+                kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+                kIOHIDDeviceUsageKey as String: kHIDUsage_GD_SystemControl
+            ]
+        ]
+
+        IOHIDManagerSetDeviceMatchingMultiple(manager, matches as CFArray)
+        let context = Unmanaged.passUnretained(self).toOpaque()
+
+        IOHIDManagerRegisterInputValueCallback(manager, { context, _, _, value in
+            guard let context else { return }
+            let manager = Unmanaged<HeadsetProbeManager>.fromOpaque(context).takeUnretainedValue()
+            manager.handleHIDValue(value)
+        }, context)
+
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        let openOptions = IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
+        IOHIDManagerOpen(manager, openOptions)
+        hidManager = manager
+    }
+
+    private func removeHIDControl() {
+        guard let hidManager else { return }
+        IOHIDManagerUnscheduleFromRunLoop(hidManager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        IOHIDManagerClose(hidManager, IOOptionBits(kIOHIDOptionsTypeNone))
+        self.hidManager = nil
+    }
+
+    private func syncRemoteCommandProbe() {
+        if controlsEnabled && airPodsControlEnabled {
+            installRemoteCommandProbe()
+        } else {
+            removeRemoteCommandProbe()
+        }
+    }
+
+    private func installRemoteCommandProbe() {
+        guard remoteCommandTargets.isEmpty else { return }
+        startSilentAirPodsProbeAudio()
+        publishAirPodsProbeNowPlaying()
+        let center = MPRemoteCommandCenter.shared()
+        let commands: [(String, MPRemoteCommand)] = [
+            ("remote play", center.playCommand),
+            ("remote pause", center.pauseCommand),
+            ("remote togglePlayPause", center.togglePlayPauseCommand),
+            ("remote stop", center.stopCommand),
+            ("remote nextTrack", center.nextTrackCommand),
+            ("remote previousTrack", center.previousTrackCommand),
+            ("remote skipForward", center.skipForwardCommand),
+            ("remote skipBackward", center.skipBackwardCommand),
+            ("remote seekForward", center.seekForwardCommand),
+            ("remote seekBackward", center.seekBackwardCommand)
+        ]
+
+        for (label, command) in commands {
+            command.isEnabled = true
+            let target = command.addTarget { [weak self] event in
+                self?.logRemoteCommand(label, event: event)
+                return .success
+            }
+            remoteCommandTargets.append(RemoteCommandTarget(command: command, target: target))
+        }
+        startAirPodsNowPlayingTimer()
+    }
+
+    private func removeRemoteCommandProbe() {
+        for target in remoteCommandTargets {
+            target.command.removeTarget(target.target)
+            target.command.isEnabled = false
+        }
+        remoteCommandTargets.removeAll()
+        stopAirPodsNowPlayingTimer()
+        stopSilentAirPodsProbeAudio()
+        clearAirPodsProbeNowPlaying()
+    }
+
+    private func logRemoteCommand(_ label: String, event: MPRemoteCommandEvent) {
+        Self.appendAirPodsDebugLog("mp label=\(label) recording=\(isRecording())")
+        refreshAirPodsRemoteTarget()
+        handleAirPodsRemoteCommand(label)
+    }
+
+    private func handleAirPodsRemoteCommand(_ label: String) {
+        guard airPodsControlEnabled else {
+            Self.appendAirPodsDebugLog("ignored label=\(label) reason=disabled")
+            return
+        }
+        let recording = isRecording()
+        if recording {
+            Self.appendAirPodsDebugLog("accept-stop label=\(label)")
+        } else {
+            guard label == "remote nextTrack" || label == "hid nextTrack" else {
+                Self.appendAirPodsDebugLog("ignored label=\(label) recording=false reason=not-start-command")
+                return
+            }
+        }
+        if let lastAirPodsToggleAt, Date().timeIntervalSince(lastAirPodsToggleAt) < 0.45 {
+            Self.appendAirPodsDebugLog("ignored label=\(label) reason=debounce")
+            return
+        }
+        lastAirPodsToggleAt = Date()
+        Self.appendAirPodsDebugLog("toggle label=\(label) recordingBefore=\(recording)")
+        DispatchQueue.main.async { [onAirPodsTogglePressed] in
+            onAirPodsTogglePressed()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.refreshAirPodsRemoteTarget()
+        }
+    }
+
+    private func startAirPodsNowPlayingTimer() {
+        stopAirPodsNowPlayingTimer()
+        airPodsNowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
+            self?.refreshAirPodsRemoteTarget()
+        }
+    }
+
+    private func stopAirPodsNowPlayingTimer() {
+        airPodsNowPlayingTimer?.invalidate()
+        airPodsNowPlayingTimer = nil
+    }
+
+    private func refreshAirPodsRemoteTarget() {
+        ensureSilentAirPodsProbeAudio()
+        publishAirPodsProbeNowPlaying()
+    }
+
+    private func ensureSilentAirPodsProbeAudio() {
+        guard airPodsControlEnabled else { return }
+        guard let engine = airPodsProbeEngine,
+              let player = airPodsProbePlayer else {
+            startSilentAirPodsProbeAudio()
+            return
+        }
+
+        if !engine.isRunning {
+            try? engine.start()
+        }
+
+        if !player.isPlaying {
+            player.play()
+        }
+    }
+
+    private func startSilentAirPodsProbeAudio() {
+        guard airPodsProbeEngine == nil, airPodsProbePlayer == nil else { return }
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 44_100) else {
+            return
+        }
+
+        buffer.frameLength = buffer.frameCapacity
+        if let channelData = buffer.floatChannelData {
+            channelData[0].initialize(repeating: 0, count: Int(buffer.frameLength))
+        }
+
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        player.volume = 0
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+
+        do {
+            try engine.start()
+            player.scheduleBuffer(buffer, at: nil, options: .loops)
+            player.play()
+            airPodsProbeEngine = engine
+            airPodsProbePlayer = player
+        } catch {
+            engine.detach(player)
+        }
+    }
+
+    private func stopSilentAirPodsProbeAudio() {
+        airPodsProbePlayer?.stop()
+        airPodsProbeEngine?.stop()
+        if let airPodsProbeEngine, let airPodsProbePlayer {
+            airPodsProbeEngine.detach(airPodsProbePlayer)
+        }
+        airPodsProbePlayer = nil
+        airPodsProbeEngine = nil
+    }
+
+    private func publishAirPodsProbeNowPlaying() {
+        let center = MPNowPlayingInfoCenter.default()
+        center.nowPlayingInfo = [
+            MPMediaItemPropertyTitle: "wire AirPods Control",
+            MPMediaItemPropertyArtist: "wire",
+            MPNowPlayingInfoPropertyPlaybackRate: 1.0,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: 0.0
+        ]
+        center.playbackState = .playing
+    }
+
+    private func clearAirPodsProbeNowPlaying() {
+        let center = MPNowPlayingInfoCenter.default()
+        center.playbackState = .stopped
+        center.nowPlayingInfo = nil
+    }
+
+    private func handleHIDValue(_ value: IOHIDValue) {
+        let element = IOHIDValueGetElement(value)
+        let usagePage = IOHIDElementGetUsagePage(element)
+        let usage = IOHIDElementGetUsage(element)
+        let intValue = IOHIDValueGetIntegerValue(value)
+        guard usagePage == kHIDPage_Consumer else { return }
+        if usage == Self.playPauseUsage {
+            handlePlayPauseValue(intValue)
+        } else if usage == Self.nextTrackUsage, intValue != 0 {
+            Self.appendAirPodsDebugLog("hid usage=nextTrack recording=\(isRecording())")
+            handleAirPodsRemoteCommand("hid nextTrack")
+        }
+    }
+
+    private func handlePlayPauseValue(_ value: CFIndex) {
+        if value != 0 {
+            headsetPressStartedAt = Date()
+            longPressActive = false
+            longPressWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.activateLongPressIfStillDown()
+            }
+            longPressWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.longPressThreshold, execute: workItem)
+        } else {
+            let shouldStopHold = longPressActive && mode == .longPressHold
+            cancelPendingLongPress()
+            if shouldStopHold {
+                DispatchQueue.main.async { [onHoldReleased] in
+                    onHoldReleased()
+                }
+            }
+        }
+    }
+
+    private func activateLongPressIfStillDown() {
+        guard headsetPressStartedAt != nil, mode.controlsWiredRecording, !longPressActive else { return }
+        longPressActive = true
+
+        switch mode {
+        case .longPressHold:
+            onHoldPressed()
+        case .longPressToggle:
+            onTogglePressed()
+        }
+    }
+
+    private func cancelPendingLongPress() {
+        longPressWorkItem?.cancel()
+        longPressWorkItem = nil
+        headsetPressStartedAt = nil
+        longPressActive = false
+    }
 }
 
 // MARK: - Audio Recorder
 
-final class AudioRecorder {
+final class AudioRecorder: NSObject {
     private var engine: AVAudioEngine?
     private var outputFile: AVAudioFile?
     private var tempURL: URL?
+    private var audioQueue: AudioQueueRef?
+    private var audioQueueFile: AudioFileID?
+    private var audioQueueTempURL: URL?
+    private var audioQueueFormat = AudioStreamBasicDescription()
+    private var audioQueuePacketIndex: Int64 = 0
+    private var audioQueueIsRunning = false
+
+    private static func appendRecorderDebugLog(_ message: String) {
+        let formatter = ISO8601DateFormatter()
+        let line = "\(formatter.string(from: Date())) \(message)\n"
+        let url = URL(fileURLWithPath: "/tmp/wire-recorder.log")
+        guard let data = line.data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: url.path),
+           let handle = try? FileHandle(forWritingTo: url) {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
 
     var isRecording: Bool { engine?.isRunning ?? false }
+    var hasActiveRecording: Bool {
+        (engine != nil && tempURL != nil) || audioQueue != nil
+    }
 
     /// Start recording to a temporary WAV file
-    func start() throws {
-        guard !isRecording else { return }
+    func start(inputDeviceID: AudioDeviceID? = nil) throws {
+        guard !hasActiveRecording else { return }
+        if inputDeviceID != nil {
+            try startBuiltInMicCapture()
+            return
+        }
 
         let engine = AVAudioEngine()
         self.engine = engine
@@ -546,8 +1395,134 @@ final class AudioRecorder {
         try engine.start()
     }
 
+    private func startBuiltInMicCapture() throws {
+        let deviceUID = try DefaultAudioInputOverride.builtInInputDeviceUID()
+        let deviceName = try DefaultAudioInputOverride.builtInInputDeviceName()
+        Self.appendRecorderDebugLog("start-built-in deviceName=\(deviceName) uid=\(deviceUID)")
+        var format = AudioStreamBasicDescription(
+            mSampleRate: 16_000,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
+            mBytesPerPacket: 2,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 2,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 16,
+            mReserved: 0
+        )
+
+        var queue: AudioQueueRef?
+        var status = AudioQueueNewInput(
+            &format,
+            Self.audioQueueInputCallback,
+            Unmanaged.passUnretained(self).toOpaque(),
+            nil,
+            nil,
+            0,
+            &queue
+        )
+        guard status == noErr, let queue else {
+            throw AppError.transcriptionFailed("Could not start Mac microphone recorder: \(status)")
+        }
+
+        var currentDevice = deviceUID as CFString
+        status = withUnsafePointer(to: &currentDevice) { pointer in
+            AudioQueueSetProperty(
+                queue,
+                kAudioQueueProperty_CurrentDevice,
+                pointer,
+                UInt32(MemoryLayout<CFString>.size)
+            )
+        }
+        guard status == noErr else {
+            AudioQueueDispose(queue, true)
+            throw AppError.transcriptionFailed("Could not select Mac microphone: \(status)")
+        }
+
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("caf")
+        var file: AudioFileID?
+        status = AudioFileCreateWithURL(tempURL as CFURL, kAudioFileCAFType, &format, .eraseFile, &file)
+        guard status == noErr, let file else {
+            AudioQueueDispose(queue, true)
+            throw AppError.transcriptionFailed("Could not create microphone recording file: \(status)")
+        }
+
+        audioQueue = queue
+        audioQueueFile = file
+        audioQueueTempURL = tempURL
+        audioQueueFormat = format
+        audioQueuePacketIndex = 0
+        audioQueueIsRunning = true
+
+        let bufferByteSize: UInt32 = 32_768
+        for _ in 0..<3 {
+            var buffer: AudioQueueBufferRef?
+            status = AudioQueueAllocateBuffer(queue, bufferByteSize, &buffer)
+            guard status == noErr, let buffer else {
+                _ = stopBuiltInMicCapture()
+                throw AppError.transcriptionFailed("Could not allocate microphone buffer: \(status)")
+            }
+            status = AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
+            guard status == noErr else {
+                _ = stopBuiltInMicCapture()
+                throw AppError.transcriptionFailed("Could not queue microphone buffer: \(status)")
+            }
+        }
+
+        status = AudioQueueStart(queue, nil)
+        guard status == noErr else {
+            _ = stopBuiltInMicCapture()
+            throw AppError.transcriptionFailed("Could not start microphone capture: \(status)")
+        }
+    }
+
+    private static let audioQueueInputCallback: AudioQueueInputCallback = { userData, queue, buffer, _, packetCount, packetDescriptions in
+        guard let userData else { return }
+        let recorder = Unmanaged<AudioRecorder>.fromOpaque(userData).takeUnretainedValue()
+        recorder.handleAudioQueueBuffer(queue: queue, buffer: buffer, packetCount: packetCount, packetDescriptions: packetDescriptions)
+    }
+
+    private func handleAudioQueueBuffer(
+        queue: AudioQueueRef,
+        buffer: AudioQueueBufferRef,
+        packetCount: UInt32,
+        packetDescriptions: UnsafePointer<AudioStreamPacketDescription>?
+    ) {
+        guard audioQueueIsRunning, let file = audioQueueFile else { return }
+
+        var packetsToWrite = packetCount
+        if packetsToWrite == 0, audioQueueFormat.mBytesPerPacket > 0 {
+            packetsToWrite = buffer.pointee.mAudioDataByteSize / audioQueueFormat.mBytesPerPacket
+        }
+
+        if packetsToWrite > 0 {
+            var mutablePacketCount = packetsToWrite
+            let status = AudioFileWritePackets(
+                file,
+                false,
+                buffer.pointee.mAudioDataByteSize,
+                packetDescriptions,
+                audioQueuePacketIndex,
+                &mutablePacketCount,
+                buffer.pointee.mAudioData
+            )
+            if status == noErr {
+                audioQueuePacketIndex += Int64(mutablePacketCount)
+            }
+        }
+
+        if audioQueueIsRunning {
+            AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
+        }
+    }
+
     /// Stop recording and return the audio data
     private func stopAndTranscribe() -> Data? {
+        if audioQueue != nil || audioQueueFile != nil {
+            return stopBuiltInMicCapture()
+        }
         guard let engine = engine, let url = tempURL else { return nil }
 
         engine.inputNode.removeTap(onBus: 0)
@@ -558,6 +1533,29 @@ final class AudioRecorder {
 
         defer { try? FileManager.default.removeItem(at: url) }
         return normalizedWavData(from: url) ?? (try? Data(contentsOf: url))
+    }
+
+    private func stopBuiltInMicCapture() -> Data? {
+        audioQueueIsRunning = false
+        if let audioQueue {
+            AudioQueueStop(audioQueue, true)
+            AudioQueueDispose(audioQueue, true)
+        }
+        if let audioQueueFile {
+            AudioFileClose(audioQueueFile)
+        }
+        let url = audioQueueTempURL
+        resetBuiltInMicCapture()
+        guard let url else { return nil }
+        defer { try? FileManager.default.removeItem(at: url) }
+        return normalizedWavData(from: url) ?? (try? Data(contentsOf: url))
+    }
+
+    private func resetBuiltInMicCapture() {
+        audioQueue = nil
+        audioQueueFile = nil
+        audioQueueTempURL = nil
+        audioQueuePacketIndex = 0
     }
 
     private func normalizedWavData(from inputURL: URL) -> Data? {
@@ -924,14 +1922,29 @@ final class HoverMenuButton: NSButton {
 }
 
 final class PopoverViewController: NSViewController {
+    private enum Layout {
+        static let width: CGFloat = 300
+        static let expandedHeight: CGFloat = 386
+        static let collapsedHeight: CGFloat = 322
+    }
+
     private let state: AppState
     private let hotKeyManager: HotKeyManager
+    private let headsetProbeManager: HeadsetProbeManager
     private let statusLabel = NSTextField(labelWithString: "")
     private let toggleShortcutButton = NSButton(title: "", target: nil, action: nil)
     private let holdShortcutButton = NSButton(title: "", target: nil, action: nil)
+    private let headsetModePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let headsetControlsSwitch = NSSwitch()
+    private let sendEnterAfterPasteSwitch = NSSwitch()
+    private let airPodsControlSwitch = NSSwitch()
+    private let airPodsInfoButton = NSButton(title: "", target: nil, action: nil)
     private let transcriptLabel = NSTextField(labelWithString: "No recent transcription")
     private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
     private let loadingIndicator = NSProgressIndicator()
+    private var headsetSettingsRows: [NSView] = []
+    private var headsetCollapsedSpacer: NSView?
+    private var airPodsInfoPopover: NSPopover?
     private var shortcutMonitor: Any?
     private var shortcutCaptureTarget: HotKeyKind?
     private var shortcutCaptureKeyCode: UInt32?
@@ -939,9 +1952,10 @@ final class PopoverViewController: NSViewController {
     private var shortcutCaptureCurrentModifiers: UInt32 = 0
     private var shortcutCapturePressedKeyCodes = Set<UInt16>()
 
-    init(state: AppState, hotKeyManager: HotKeyManager) {
+    init(state: AppState, hotKeyManager: HotKeyManager, headsetProbeManager: HeadsetProbeManager) {
         self.state = state
         self.hotKeyManager = hotKeyManager
+        self.headsetProbeManager = headsetProbeManager
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -950,7 +1964,7 @@ final class PopoverViewController: NSViewController {
     }
 
     override func loadView() {
-        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 300, height: 256))
+        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: Layout.width, height: Layout.expandedHeight))
         visual.material = .menu
         visual.blendingMode = .behindWindow
         visual.state = .active
@@ -963,21 +1977,21 @@ final class PopoverViewController: NSViewController {
         let root = NSStackView()
         root.orientation = .vertical
         root.spacing = 0
+        root.detachesHiddenViews = true
         root.edgeInsets = NSEdgeInsets(top: 8, left: 0, bottom: 6, right: 0)
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            root.topAnchor.constraint(equalTo: view.topAnchor),
-            root.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            root.topAnchor.constraint(equalTo: view.topAnchor)
         ])
 
         let header = NSStackView()
         header.orientation = .horizontal
         header.alignment = .centerY
         header.spacing = 10
-        header.edgeInsets = NSEdgeInsets(top: 6, left: 14, bottom: 8, right: 14)
+        header.edgeInsets = NSEdgeInsets(top: 6, left: 14, bottom: 11, right: 14)
 
         let mic = NSImageView(image: NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil) ?? NSImage())
         mic.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
@@ -1015,17 +2029,6 @@ final class PopoverViewController: NSViewController {
         root.addArrangedSubview(header)
         root.addArrangedSubview(divider())
 
-        root.addArrangedSubview(sectionLabel("Settings"))
-        holdShortcutButton.target = self
-        holdShortcutButton.action = #selector(captureHoldShortcut)
-        root.addArrangedSubview(menuRow(symbol: "keyboard.badge.ellipsis", title: "Hold shortcut", trailing: holdShortcutButton))
-
-        toggleShortcutButton.target = self
-        toggleShortcutButton.action = #selector(captureToggleShortcut)
-        root.addArrangedSubview(menuRow(symbol: "keyboard", title: "Toggle shortcut", trailing: toggleShortcutButton))
-        root.addArrangedSubview(spacer(height: 8))
-
-        root.addArrangedSubview(divider())
         root.addArrangedSubview(sectionLabel("Latest"))
         transcriptLabel.font = .systemFont(ofSize: 12)
         transcriptLabel.textColor = .secondaryLabelColor
@@ -1056,7 +2059,56 @@ final class PopoverViewController: NSViewController {
         root.addArrangedSubview(padded(latestRow, left: 14, right: 14, top: 3, bottom: 8))
 
         root.addArrangedSubview(divider())
-        root.addArrangedSubview(clickableMenuRow(symbol: "power", title: "Quit", action: #selector(quitApp)))
+        root.addArrangedSubview(sectionLabel("Settings"))
+        holdShortcutButton.target = self
+        holdShortcutButton.action = #selector(captureHoldShortcut)
+        root.addArrangedSubview(menuRow(symbol: "keyboard.badge.ellipsis", title: "Hold shortcut", trailing: holdShortcutButton))
+        root.addArrangedSubview(spacer(height: 7))
+
+        toggleShortcutButton.target = self
+        toggleShortcutButton.action = #selector(captureToggleShortcut)
+        root.addArrangedSubview(menuRow(symbol: "keyboard", title: "Toggle shortcut", trailing: toggleShortcutButton))
+        root.addArrangedSubview(spacer(height: 8))
+
+        root.addArrangedSubview(divider())
+        root.addArrangedSubview(sectionLabel("Headset"))
+        configureSwitch(headsetControlsSwitch, action: #selector(toggleHeadsetControls))
+        root.addArrangedSubview(menuRow(symbol: "switch.2", title: "Headset controls", trailing: headsetControlsSwitch))
+        let collapsedSpacer = spacer(height: 7)
+        root.addArrangedSubview(collapsedSpacer)
+        headsetCollapsedSpacer = collapsedSpacer
+
+        headsetModePopup.addItems(withTitles: HeadsetButtonMode.allCases.map(\.title))
+        headsetModePopup.target = self
+        headsetModePopup.action = #selector(changeHeadsetMode)
+        headsetModePopup.widthAnchor.constraint(equalToConstant: 178).isActive = true
+        let wiredButtonRow = menuRow(symbol: "headphones", title: "Wired", trailing: headsetModePopup)
+        root.addArrangedSubview(wiredButtonRow)
+
+        configureSwitch(airPodsControlSwitch, action: #selector(toggleAirPodsControl))
+        airPodsInfoButton.bezelStyle = .inline
+        airPodsInfoButton.isBordered = false
+        airPodsInfoButton.imagePosition = .imageOnly
+        airPodsInfoButton.target = self
+        airPodsInfoButton.action = #selector(showAirPodsInfo)
+        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Experimental AirPods details") {
+            infoImage.isTemplate = true
+            airPodsInfoButton.image = infoImage
+        }
+        airPodsInfoButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        airPodsInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        let airPodsControlRow = menuRow(symbol: "airpodspro", title: "AirPods controls (experimental)", trailing: trailingGroup([airPodsInfoButton, airPodsControlSwitch]))
+        root.addArrangedSubview(airPodsControlRow)
+
+        configureSwitch(sendEnterAfterPasteSwitch, action: #selector(toggleSendEnterAfterPaste))
+        let sendEnterRow = menuRow(symbol: "return", title: "Press Return after paste", trailing: sendEnterAfterPasteSwitch)
+        root.addArrangedSubview(sendEnterRow)
+        let headsetBottomSpacer = spacer(height: 5)
+        root.addArrangedSubview(headsetBottomSpacer)
+        headsetSettingsRows = [wiredButtonRow, airPodsControlRow, sendEnterRow, headsetBottomSpacer]
+
+        root.addArrangedSubview(divider())
+        root.addArrangedSubview(clickableMenuRow(symbol: "power", title: "Quit", action: #selector(quitApp), destructive: true))
     }
 
     private func divider() -> NSBox {
@@ -1068,6 +2120,8 @@ final class PopoverViewController: NSViewController {
     private func spacer(height: CGFloat) -> NSView {
         let view = NSView()
         view.heightAnchor.constraint(equalToConstant: height).isActive = true
+        view.setContentHuggingPriority(.required, for: .vertical)
+        view.setContentCompressionResistancePriority(.required, for: .vertical)
         return view
     }
 
@@ -1075,7 +2129,7 @@ final class PopoverViewController: NSViewController {
         let label = NSTextField(labelWithString: text.uppercased())
         label.font = .systemFont(ofSize: 10, weight: .medium)
         label.textColor = .tertiaryLabelColor
-        return padded(label, left: 14, right: 14, top: 8, bottom: 3)
+        return padded(label, left: 14, right: 14, top: 8, bottom: 7)
     }
 
     private func padded(_ child: NSView, left: CGFloat, right: CGFloat, top: CGFloat, bottom: CGFloat) -> NSView {
@@ -1091,12 +2145,22 @@ final class PopoverViewController: NSViewController {
         return container
     }
 
+    private func configureSwitch(_ control: NSSwitch, action: Selector) {
+        control.target = self
+        control.action = action
+        control.controlSize = .small
+        control.widthAnchor.constraint(equalToConstant: 38).isActive = true
+        control.heightAnchor.constraint(equalToConstant: 22).isActive = true
+    }
+
     private func menuRow(symbol: String, title: String, trailing: NSView) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 10
         row.edgeInsets = NSEdgeInsets(top: 4, left: 14, bottom: 4, right: 14)
+        row.setContentHuggingPriority(.required, for: .vertical)
+        row.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
         icon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
@@ -1113,12 +2177,23 @@ final class PopoverViewController: NSViewController {
         return row
     }
 
-    private func clickableMenuRow(symbol: String, title: String, action: Selector) -> NSView {
-        let button = HoverMenuButton(title: "", target: self, action: action)
-        return clickableMenuRow(symbol: symbol, title: title, button: button)
+    private func trailingGroup(_ views: [NSView]) -> NSView {
+        let group = NSStackView()
+        group.orientation = .horizontal
+        group.alignment = .centerY
+        group.spacing = 6
+        for view in views {
+            group.addArrangedSubview(view)
+        }
+        return group
     }
 
-    private func clickableMenuRow(symbol: String, title: String, button: NSButton) -> NSView {
+    private func clickableMenuRow(symbol: String, title: String, action: Selector, destructive: Bool = false) -> NSView {
+        let button = HoverMenuButton(title: "", target: self, action: action)
+        return clickableMenuRow(symbol: symbol, title: title, button: button, destructive: destructive)
+    }
+
+    private func clickableMenuRow(symbol: String, title: String, button: NSButton, destructive: Bool = false) -> NSView {
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1138,11 +2213,14 @@ final class PopoverViewController: NSViewController {
 
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
         icon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
-        icon.contentTintColor = .secondaryLabelColor
+        icon.contentTintColor = destructive ? .systemRed : .secondaryLabelColor
         icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
 
         let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: 13)
+        if destructive {
+            label.textColor = .systemRed
+        }
 
         row.addArrangedSubview(icon)
         row.addArrangedSubview(label)
@@ -1185,6 +2263,19 @@ final class PopoverViewController: NSViewController {
                 self.loadingIndicator.stopAnimation(nil)
             }
 
+            self.headsetControlsSwitch.state = self.state.headsetControlsEnabled ? .on : .off
+            self.headsetModePopup.selectItem(at: self.headsetProbeManager.currentMode.rawValue)
+            self.airPodsControlSwitch.state = self.headsetProbeManager.isAirPodsControlEnabled ? .on : .off
+            self.sendEnterAfterPasteSwitch.state = self.state.sendEnterAfterPaste ? .on : .off
+            self.headsetModePopup.isEnabled = self.state.headsetControlsEnabled
+            self.airPodsControlSwitch.isEnabled = self.state.headsetControlsEnabled
+            self.airPodsInfoButton.isEnabled = self.state.headsetControlsEnabled
+            self.sendEnterAfterPasteSwitch.isEnabled = self.state.headsetControlsEnabled
+            self.headsetSettingsRows.forEach { $0.isHidden = !self.state.headsetControlsEnabled }
+            self.headsetCollapsedSpacer?.isHidden = self.state.headsetControlsEnabled
+            let height = self.state.headsetControlsEnabled ? Layout.expandedHeight : Layout.collapsedHeight
+            self.preferredContentSize = NSSize(width: Layout.width, height: height)
+
             if self.state.transcriptionStage == .transcribing {
                 self.transcriptLabel.stringValue = "Loading… transcribing audio"
             } else {
@@ -1204,6 +2295,65 @@ final class PopoverViewController: NSViewController {
         pasteboard.clearContents()
         pasteboard.setString(state.lastTranscription, forType: .string)
         state.statusText = "Copied latest transcription"
+    }
+
+    @objc private func toggleHeadsetControls() {
+        (NSApp.delegate as? AppDelegate)?.setHeadsetControlsEnabled(headsetControlsSwitch.state == .on)
+        refresh()
+    }
+
+    @objc private func changeHeadsetMode() {
+        let selectedMode = HeadsetButtonMode(rawValue: headsetModePopup.indexOfSelectedItem) ?? .longPressHold
+        headsetProbeManager.setMode(selectedMode)
+        refresh()
+    }
+
+    @objc private func toggleAirPodsControl() {
+        headsetProbeManager.setAirPodsControlEnabled(airPodsControlSwitch.state == .on)
+        refresh()
+    }
+
+    @objc private func showAirPodsInfo() {
+        if let airPodsInfoPopover, airPodsInfoPopover.isShown {
+            airPodsInfoPopover.performClose(nil)
+            return
+        }
+
+        let label = NSTextField(labelWithString: "Left tap (next track) starts/stops recording.\nUses this Mac's microphone.\nMay interrupt music controls.")
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 0
+        label.preferredMaxLayoutWidth = 198
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 222, height: 88))
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: 222),
+            container.heightAnchor.constraint(equalToConstant: 88),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10)
+        ])
+
+        let controller = NSViewController()
+        controller.view = container
+        controller.preferredContentSize = NSSize(width: 222, height: 88)
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 222, height: 88)
+        popover.contentViewController = controller
+        airPodsInfoPopover = popover
+        popover.show(relativeTo: airPodsInfoButton.bounds, of: airPodsInfoButton, preferredEdge: .maxY)
+    }
+
+    @objc private func toggleSendEnterAfterPaste() {
+        (NSApp.delegate as? AppDelegate)?.setSendEnterAfterPaste(sendEnterAfterPasteSwitch.state == .on)
+        refresh()
     }
 
     @objc private func captureToggleShortcut() {
