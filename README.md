@@ -1,5 +1,9 @@
 # wire
 
+<p align="center">
+  <img src="Assets/wire.iconset/icon_512x512.png" width="128" alt="wire icon">
+</p>
+
 `wire` is a small macOS menu bar voice transcriber. It records from your microphone, sends audio to the same ChatGPT/Codex transcription endpoint used by Codex dictation, then copies/pastes the transcript.
 
 ## Requirements
