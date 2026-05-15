@@ -66,6 +66,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let computerControlsEnabledDefaultsKey = "computerControlsEnabled"
     private static let computerAutoEnableEnabledDefaultsKey = "computerAutoEnableEnabled"
     private static let computerAutoEnablePhraseDefaultsKey = "computerAutoEnablePhrase"
+    private static let computerCustomHarnessEnabledDefaultsKey = "computerCustomHarnessEnabled"
+    private static let computerHarnessCommandDefaultsKey = "computerHarnessCommand"
+    private static let defaultComputerHarnessCommand = "codex --yolo -c 'model_reasoning_effort=\"low\"' e {{prompt}}"
 
     private let state = AppState()
     private var statusItem: NSStatusItem!
@@ -91,6 +94,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.computerControlsEnabled = UserDefaults.standard.bool(forKey: Self.computerControlsEnabledDefaultsKey)
         state.computerAutoEnableEnabled = UserDefaults.standard.bool(forKey: Self.computerAutoEnableEnabledDefaultsKey)
         state.computerAutoEnablePhrase = UserDefaults.standard.string(forKey: Self.computerAutoEnablePhraseDefaultsKey) ?? ""
+        state.computerCustomHarnessEnabled = UserDefaults.standard.bool(forKey: Self.computerCustomHarnessEnabledDefaultsKey)
+        state.computerHarnessCommand = UserDefaults.standard.string(forKey: Self.computerHarnessCommandDefaultsKey) ?? Self.defaultComputerHarnessCommand
 
         // Initialize components
         codexClient = CodexAPIClient()
@@ -723,16 +728,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         state.computerCommandRunning = true
-        state.statusText = "Running Codex"
+        let usesCustomHarness = state.computerCustomHarnessEnabled && !state.computerHarnessCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        state.statusText = usesCustomHarness ? "Running harness..." : "Running codex..."
 
         let process = Process()
-        if FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/codex") {
-            process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/codex")
-            process.arguments = ["--yolo", "e", prompt]
-        } else {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["codex", "--yolo", "e", prompt]
-        }
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", renderedHarnessCommand(for: prompt)]
         process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
 
         let outputPipe = Pipe()
@@ -768,7 +769,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let status = process.terminationStatus
                 DispatchQueue.main.async {
                     self?.state.computerCommandRunning = false
-                    self?.state.statusText = status == 0 ? "Codex finished" : "Codex exited \(status)"
+                    if usesCustomHarness {
+                        self?.state.statusText = status == 0 ? "Harness finished" : "Harness exited \(status)"
+                    } else {
+                        self?.state.statusText = status == 0 ? "Codex finished" : "Codex exited \(status)"
+                    }
                 }
             }
         }
@@ -779,9 +784,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             outputPipe.fileHandleForReading.readabilityHandler = nil
             errorPipe.fileHandleForReading.readabilityHandler = nil
             state.computerCommandRunning = false
-            state.statusText = "Could not run Codex: \(error.localizedDescription)"
+            state.statusText = usesCustomHarness
+                ? "Could not run harness: \(error.localizedDescription)"
+                : "Could not run Codex: \(error.localizedDescription)"
             state.transcriptionStage = .error(error.localizedDescription)
         }
+    }
+
+    private func renderedHarnessCommand(for prompt: String) -> String {
+        let customCommand = state.computerHarnessCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        let template = state.computerCustomHarnessEnabled && !customCommand.isEmpty
+            ? state.computerHarnessCommand
+            : Self.defaultComputerHarnessCommand
+        let escapedPrompt = shellSingleQuoted(prompt)
+
+        if template.contains("{{prompt}}") {
+            return template.replacingOccurrences(of: "{{prompt}}", with: escapedPrompt)
+        }
+        return "\(template) \(escapedPrompt)"
+    }
+
+    private func shellSingleQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
     private func fuzzyMatches(_ transcript: String, _ phrase: String) -> Bool {
@@ -866,6 +890,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : "Auto enable phrase saved"
     }
 
+    func setComputerCustomHarnessEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.computerCustomHarnessEnabledDefaultsKey)
+        state.computerCustomHarnessEnabled = enabled
+        state.statusText = enabled ? "Custom harness enabled" : "Custom harness disabled"
+    }
+
+    func setComputerHarnessCommand(_ command: String) {
+        UserDefaults.standard.set(command, forKey: Self.computerHarnessCommandDefaultsKey)
+        state.computerHarnessCommand = command
+        state.statusText = "Harness saved"
+    }
+
     private func pressReturnKey() {
         let source = CGEventSource(stateID: .hidSystemState)
         let returnKey = CGKeyCode(kVK_Return)
@@ -898,6 +934,8 @@ final class AppState {
     var computerControlsEnabled = false { didSet { onChange?() } }
     var computerAutoEnableEnabled = false { didSet { onChange?() } }
     var computerAutoEnablePhrase = "" { didSet { onChange?() } }
+    var computerCustomHarnessEnabled = false { didSet { onChange?() } }
+    var computerHarnessCommand = "" { didSet { onChange?() } }
     var computerCommandRunning = false { didSet { onChange?() } }
 }
 
@@ -2088,12 +2126,12 @@ final class HoverMenuButton: NSButton {
 final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private enum Layout {
         static let width: CGFloat = 300
-        static let headsetExpandedComputerOffHeight: CGFloat = 420
-        static let headsetExpandedComputerOnHeight: CGFloat = 462
-        static let headsetExpandedComputerAutoOnHeight: CGFloat = 498
-        static let headsetCollapsedComputerOffHeight: CGFloat = 356
-        static let headsetCollapsedComputerOnHeight: CGFloat = 398
-        static let headsetCollapsedComputerAutoOnHeight: CGFloat = 434
+        static let headsetExpandedComputerOffHeight: CGFloat = 404
+        static let headsetCollapsedComputerOffHeight: CGFloat = 340
+        static let computerControlsExtraHeight: CGFloat = 70
+        static let computerHiddenCommandBottomPadding: CGFloat = 12
+        static let computerCommandExtraHeight: CGFloat = 36
+        static let computerAutoPhraseExtraHeight: CGFloat = 36
     }
 
     private let state: AppState
@@ -2109,17 +2147,22 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private let airPodsInfoButton = NSButton(title: "", target: nil, action: nil)
     private let computerControlsSwitch = NSSwitch()
     private let computerInfoButton = NSButton(title: "", target: nil, action: nil)
+    private let computerCustomHarnessSwitch = NSSwitch()
+    private let computerHarnessInfoButton = NSButton(title: "", target: nil, action: nil)
     private let computerAutoEnableSwitch = NSSwitch()
     private let computerAutoEnableField = NSTextField(string: "")
+    private let computerHarnessField = NSTextField(string: "")
     private let transcriptLabel = NSTextField(labelWithString: "No recent transcription")
     private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
     private let loadingIndicator = NSProgressIndicator()
     private var headsetSettingsRows: [NSView] = []
     private var computerSettingsRows: [NSView] = []
     private var computerAutoEnableRows: [NSView] = []
+    private var computerHarnessRows: [NSView] = []
     private var headsetCollapsedSpacer: NSView?
     private var airPodsInfoPopover: NSPopover?
     private var computerInfoPopover: NSPopover?
+    private var computerHarnessInfoPopover: NSPopover?
     private var shortcutMonitor: Any?
     private var shortcutCaptureTarget: HotKeyKind?
     private var shortcutCaptureKeyCode: UInt32?
@@ -2298,6 +2341,34 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         computerInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
         root.addArrangedSubview(menuRow(symbol: "desktopcomputer", title: "Computer controls (dangerous)", trailing: trailingGroup([computerInfoButton, computerControlsSwitch])))
 
+        configureSwitch(computerCustomHarnessSwitch, action: #selector(toggleComputerCustomHarness))
+        computerHarnessInfoButton.bezelStyle = .inline
+        computerHarnessInfoButton.isBordered = false
+        computerHarnessInfoButton.imagePosition = .imageOnly
+        computerHarnessInfoButton.target = self
+        computerHarnessInfoButton.action = #selector(showComputerHarnessInfo)
+        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Custom harness details") {
+            infoImage.isTemplate = true
+            computerHarnessInfoButton.image = infoImage
+        }
+        computerHarnessInfoButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        computerHarnessInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        let customHarnessToggleRow = menuRow(symbol: "terminal", title: "Custom harness", trailing: trailingGroup([computerHarnessInfoButton, computerCustomHarnessSwitch]))
+        root.addArrangedSubview(customHarnessToggleRow)
+
+        computerHarnessField.placeholderString = "codex --yolo -c 'model_reasoning_effort=\"low\"' e {{prompt}}"
+        computerHarnessField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        computerHarnessField.bezelStyle = .roundedBezel
+        computerHarnessField.focusRingType = .none
+        computerHarnessField.controlSize = .small
+        computerHarnessField.delegate = self
+        computerHarnessField.target = self
+        computerHarnessField.action = #selector(updateComputerHarnessCommand)
+        computerHarnessField.widthAnchor.constraint(equalToConstant: 176).isActive = true
+        computerHarnessField.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        let commandRow = menuRow(symbol: "chevron.right.square", title: "Command", trailing: computerHarnessField)
+        root.addArrangedSubview(commandRow)
+
         configureSwitch(computerAutoEnableSwitch, action: #selector(toggleComputerAutoEnable))
         let autoEnableToggleRow = menuRow(symbol: "bolt.badge.automatic", title: "Auto enable", trailing: computerAutoEnableSwitch)
         root.addArrangedSubview(autoEnableToggleRow)
@@ -2316,7 +2387,8 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         root.addArrangedSubview(phraseRow)
         let computerBottomSpacer = spacer(height: 9)
         root.addArrangedSubview(computerBottomSpacer)
-        computerSettingsRows = [autoEnableToggleRow, computerBottomSpacer]
+        computerSettingsRows = [customHarnessToggleRow, autoEnableToggleRow, computerBottomSpacer]
+        computerHarnessRows = [commandRow]
         computerAutoEnableRows = [phraseRow]
 
         root.addArrangedSubview(divider())
@@ -2484,9 +2556,13 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             self.airPodsControlSwitch.state = self.headsetProbeManager.isAirPodsControlEnabled ? .on : .off
             self.sendEnterAfterPasteSwitch.state = self.state.sendEnterAfterPaste ? .on : .off
             self.computerControlsSwitch.state = self.state.computerControlsEnabled ? .on : .off
+            self.computerCustomHarnessSwitch.state = self.state.computerCustomHarnessEnabled ? .on : .off
             self.computerAutoEnableSwitch.state = self.state.computerAutoEnableEnabled ? .on : .off
             if self.computerAutoEnableField.currentEditor() == nil {
                 self.computerAutoEnableField.stringValue = self.state.computerAutoEnablePhrase
+            }
+            if self.computerHarnessField.currentEditor() == nil {
+                self.computerHarnessField.stringValue = self.state.computerHarnessCommand
             }
             self.headsetModePopup.isEnabled = self.state.headsetControlsEnabled
             self.airPodsControlSwitch.isEnabled = self.state.headsetControlsEnabled
@@ -2495,27 +2571,28 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             self.headsetSettingsRows.forEach { $0.isHidden = !self.state.headsetControlsEnabled }
             self.headsetCollapsedSpacer?.isHidden = self.state.headsetControlsEnabled
             self.computerSettingsRows.forEach { $0.isHidden = !self.state.computerControlsEnabled }
+            let showComputerCommand = self.state.computerControlsEnabled && self.state.computerCustomHarnessEnabled
+            self.computerHarnessRows.forEach { $0.isHidden = !showComputerCommand }
             let showComputerPhrase = self.state.computerControlsEnabled && self.state.computerAutoEnableEnabled
             self.computerAutoEnableRows.forEach { $0.isHidden = !showComputerPhrase }
-            let height: CGFloat
-            switch (self.state.headsetControlsEnabled, self.state.computerControlsEnabled, showComputerPhrase) {
-            case (true, true, true):
-                height = Layout.headsetExpandedComputerAutoOnHeight
-            case (true, true, false):
-                height = Layout.headsetExpandedComputerOnHeight
-            case (true, false, _):
-                height = Layout.headsetExpandedComputerOffHeight
-            case (false, true, true):
-                height = Layout.headsetCollapsedComputerAutoOnHeight
-            case (false, true, false):
-                height = Layout.headsetCollapsedComputerOnHeight
-            case (false, false, _):
-                height = Layout.headsetCollapsedComputerOffHeight
+            var height = self.state.headsetControlsEnabled ? Layout.headsetExpandedComputerOffHeight : Layout.headsetCollapsedComputerOffHeight
+            if self.state.computerControlsEnabled {
+                height += Layout.computerControlsExtraHeight
+            }
+            if self.state.computerControlsEnabled && !showComputerCommand {
+                height += Layout.computerHiddenCommandBottomPadding
+            }
+            if showComputerCommand {
+                height += Layout.computerCommandExtraHeight
+            }
+            if showComputerPhrase {
+                height += Layout.computerAutoPhraseExtraHeight
             }
             self.preferredContentSize = NSSize(width: Layout.width, height: height)
 
             if self.state.computerCommandRunning {
-                self.transcriptLabel.stringValue = "Running Codex..."
+                let usesCustomHarness = self.state.computerCustomHarnessEnabled && !self.state.computerHarnessCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                self.transcriptLabel.stringValue = usesCustomHarness ? "Running harness..." : "Running codex..."
             } else if self.state.transcriptionStage == .transcribing {
                 self.transcriptLabel.stringValue = "Loading… transcribing audio"
             } else {
@@ -2602,6 +2679,12 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         refresh()
     }
 
+    @objc private func toggleComputerCustomHarness() {
+        (NSApp.delegate as? AppDelegate)?.setComputerCustomHarnessEnabled(computerCustomHarnessSwitch.state == .on)
+        view.window?.makeFirstResponder(nil)
+        refresh()
+    }
+
     @objc private func toggleComputerAutoEnable() {
         (NSApp.delegate as? AppDelegate)?.setComputerAutoEnableEnabled(computerAutoEnableSwitch.state == .on)
         view.window?.makeFirstResponder(nil)
@@ -2614,9 +2697,18 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         refresh()
     }
 
+    @objc private func updateComputerHarnessCommand() {
+        (NSApp.delegate as? AppDelegate)?.setComputerHarnessCommand(computerHarnessField.stringValue)
+        view.window?.makeFirstResponder(nil)
+        refresh()
+    }
+
     func controlTextDidEndEditing(_ obj: Notification) {
-        guard obj.object as? NSTextField === computerAutoEnableField else { return }
-        updateComputerAutoEnablePhrase()
+        if obj.object as? NSTextField === computerAutoEnableField {
+            updateComputerAutoEnablePhrase()
+        } else if obj.object as? NSTextField === computerHarnessField {
+            updateComputerHarnessCommand()
+        }
     }
 
     @objc private func showComputerInfo() {
@@ -2625,7 +2717,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             return
         }
 
-        let label = NSTextField(labelWithString: "When Computer controls are on, each transcript runs through Codex with full local execution permissions.\nAuto enable only works when its switch is on and the phrase has at least two words.")
+        let label = NSTextField(labelWithString: "When Computer controls are on, each transcript runs through a local shell command with full execution permissions.\nBy default it runs Codex with low reasoning effort.\nAuto enable only works when its switch is on and the phrase has at least two words.")
         label.font = .systemFont(ofSize: 12)
         label.textColor = .labelColor
         label.lineBreakMode = .byWordWrapping
@@ -2633,12 +2725,12 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         label.preferredMaxLayoutWidth = 218
         label.translatesAutoresizingMaskIntoConstraints = false
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 242, height: 128))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 254, height: 148))
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(label)
         NSLayoutConstraint.activate([
-            container.widthAnchor.constraint(equalToConstant: 242),
-            container.heightAnchor.constraint(equalToConstant: 128),
+            container.widthAnchor.constraint(equalToConstant: 254),
+            container.heightAnchor.constraint(equalToConstant: 148),
             label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
             label.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
@@ -2647,14 +2739,52 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
 
         let controller = NSViewController()
         controller.view = container
-        controller.preferredContentSize = NSSize(width: 242, height: 128)
+        controller.preferredContentSize = NSSize(width: 254, height: 148)
 
         let popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 242, height: 128)
+        popover.contentSize = NSSize(width: 254, height: 148)
         popover.contentViewController = controller
         computerInfoPopover = popover
         popover.show(relativeTo: computerInfoButton.bounds, of: computerInfoButton, preferredEdge: .maxY)
+    }
+
+    @objc private func showComputerHarnessInfo() {
+        if let computerHarnessInfoPopover, computerHarnessInfoPopover.isShown {
+            computerHarnessInfoPopover.performClose(nil)
+            return
+        }
+
+        let label = NSTextField(labelWithString: "Custom harness replaces the default Codex command.\nUse {{prompt}} where the transcript should go.\nIf {{prompt}} is missing, the transcript is appended at the end.")
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 0
+        label.preferredMaxLayoutWidth = 218
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 254, height: 124))
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: 254),
+            container.heightAnchor.constraint(equalToConstant: 124),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10)
+        ])
+
+        let controller = NSViewController()
+        controller.view = container
+        controller.preferredContentSize = NSSize(width: 254, height: 124)
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 254, height: 124)
+        popover.contentViewController = controller
+        computerHarnessInfoPopover = popover
+        popover.show(relativeTo: computerHarnessInfoButton.bounds, of: computerHarnessInfoButton, preferredEdge: .maxY)
     }
 
     @objc private func captureToggleShortcut() {
