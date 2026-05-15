@@ -3,6 +3,7 @@ import Carbon
 import WebKit
 import AVFoundation
 import ApplicationServices
+import ServiceManagement
 
 // MARK: - Entry point
 
@@ -13,6 +14,43 @@ struct WireApp {
         let delegate = AppDelegate()
         app.delegate = delegate
         app.run()
+    }
+}
+
+// MARK: - Launch at Login
+
+enum LaunchAtLogin {
+    static var isEnabled: Bool {
+        SMAppService.mainApp.status == .enabled
+    }
+
+    static var statusDescription: String {
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            return "Launch at login enabled"
+        case .requiresApproval:
+            return "Approve wire in System Settings → Login Items"
+        case .notRegistered:
+            return "Launch at login disabled"
+        case .notFound:
+            return "Install wire to /Applications first"
+        @unknown default:
+            return "Launch at login status unknown"
+        }
+    }
+
+    static func setEnabled(_ enabled: Bool) throws {
+        if enabled {
+            try SMAppService.mainApp.register()
+        } else {
+            try SMAppService.mainApp.unregister()
+        }
+    }
+
+    static func openLoginItemsSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
     }
 }
 
@@ -60,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 320, height: 350)
+        popover.contentSize = NSSize(width: 320, height: 380)
         popover.contentViewController = controller
 
         state.onChange = { [weak self, weak controller] in
@@ -754,6 +792,7 @@ final class PopoverViewController: NSViewController {
     private let transcriptLabel = NSTextField(labelWithString: "No recent transcription")
     private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
     private let pasteToggle = NSButton(checkboxWithTitle: "Paste into active app", target: nil, action: nil)
+    private let launchAtLoginToggle = NSButton(checkboxWithTitle: "Launch at login", target: nil, action: nil)
     private let modeControl = NSSegmentedControl(labels: ["Toggle", "Hold"], trackingMode: .selectOne, target: nil, action: nil)
     private let loadingIndicator = NSProgressIndicator()
     private var shortcutMonitor: Any?
@@ -769,7 +808,7 @@ final class PopoverViewController: NSViewController {
     }
 
     override func loadView() {
-        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 320, height: 350))
+        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 320, height: 380))
         visual.material = .menu
         visual.blendingMode = .behindWindow
         visual.state = .active
@@ -847,6 +886,10 @@ final class PopoverViewController: NSViewController {
         pasteToggle.target = self
         pasteToggle.action = #selector(returnFocusChanged)
         root.addArrangedSubview(menuRow(symbol: "doc.on.clipboard", title: "Paste result", trailing: pasteToggle))
+
+        launchAtLoginToggle.target = self
+        launchAtLoginToggle.action = #selector(launchAtLoginChanged)
+        root.addArrangedSubview(menuRow(symbol: "powerplug", title: "Startup", trailing: launchAtLoginToggle))
 
         root.addArrangedSubview(divider())
         root.addArrangedSubview(sectionLabel("Latest"))
@@ -974,6 +1017,8 @@ final class PopoverViewController: NSViewController {
             self.statusLabel.stringValue = self.state.statusText.isEmpty ? "Ready" : self.state.statusText
             self.shortcutButton.title = self.hotKeyManager.shortcutDisplay
             self.pasteToggle.state = self.state.returnToPreviousApp ? .on : .off
+            self.launchAtLoginToggle.state = LaunchAtLogin.isEnabled ? .on : .off
+            self.launchAtLoginToggle.toolTip = LaunchAtLogin.statusDescription
             self.modeControl.selectedSegment = self.state.recordingMode.rawValue
 
             switch self.state.transcriptionStage {
@@ -1011,6 +1056,21 @@ final class PopoverViewController: NSViewController {
 
     @objc private func returnFocusChanged() {
         state.returnToPreviousApp = pasteToggle.state == .on
+    }
+
+    @objc private func launchAtLoginChanged() {
+        let shouldEnable = launchAtLoginToggle.state == .on
+        do {
+            try LaunchAtLogin.setEnabled(shouldEnable)
+            state.statusText = LaunchAtLogin.statusDescription
+            if SMAppService.mainApp.status == .requiresApproval {
+                LaunchAtLogin.openLoginItemsSettings()
+            }
+        } catch {
+            launchAtLoginToggle.state = LaunchAtLogin.isEnabled ? .on : .off
+            state.statusText = "Startup failed: \(error.localizedDescription)"
+        }
+        refresh()
     }
 
     @objc private func modeChanged() {
