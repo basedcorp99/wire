@@ -58,6 +58,42 @@ enum LaunchAtLogin {
     }
 }
 
+// MARK: - Debug Logging
+
+enum DebugLog {
+    private static let maxBytes: UInt64 = 256 * 1024
+
+    static func append(_ message: String, to path: String) {
+        let formatter = ISO8601DateFormatter()
+        let line = "\(formatter.string(from: Date())) \(message)\n"
+        let url = URL(fileURLWithPath: path)
+        guard let data = line.data(using: .utf8) else { return }
+
+        rotateIfNeeded(url: url, incomingByteCount: UInt64(data.count))
+
+        if FileManager.default.fileExists(atPath: url.path),
+           let handle = try? FileHandle(forWritingTo: url) {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    private static func rotateIfNeeded(url: URL, incomingByteCount: UInt64) {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber,
+              size.uint64Value + incomingByteCount > maxBytes else {
+            return
+        }
+
+        let rotatedURL = URL(fileURLWithPath: url.path + ".1")
+        try? FileManager.default.removeItem(at: rotatedURL)
+        try? FileManager.default.moveItem(at: url, to: rotatedURL)
+    }
+}
+
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -86,9 +122,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recordingStartedAt: Date?
     private var activeRecordingShouldPressReturn = false
     private var activeRecordingStartedByAirPods = false
+    private var activeRecordingStartedByHeadsetHold = false
+    private var activeRecordingSource = ""
     private var statusSpinnerIndex = 0
     private var activeRecordingKind: HotKeyKind?
+    private var holdRecordingStartPending = false
+    private var stopHoldWhenRecordingStarts = false
+    private var selfTestTranscript: String?
+    private var selfTestTranscribeByteCounts: [Int] = []
     private let statusSpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    private static func appendTranscriptionDebugLog(_ message: String) {
+        DebugLog.append(message, to: "/tmp/wire-transcribe.log")
+    }
+
+    private static func appendHeadsetDebugLog(_ message: String) {
+        DebugLog.append(message, to: "/tmp/wire-headset.log")
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -160,6 +210,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await initializeSession()
         }
         runAirPodsCaptureSelfTestIfRequested()
+        runHeadsetPathSelfTestIfRequested()
+        runDefaultCaptureSelfTestIfRequested()
     }
 
     private func runAirPodsCaptureSelfTestIfRequested() {
@@ -188,6 +240,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             activeRecordingKind = nil
             activeRecordingShouldPressReturn = false
             activeRecordingStartedByAirPods = false
+            activeRecordingStartedByHeadsetHold = false
+            activeRecordingSource = ""
             state.isBusy = false
             state.transcriptionStage = .idle
 
@@ -207,6 +261,147 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? summary.write(to: outputURL, atomically: true, encoding: .utf8)
             NSApp.terminate(nil)
         }
+    }
+
+    private func runDefaultCaptureSelfTestIfRequested() {
+        guard let rawSeconds = ProcessInfo.processInfo.environment["WIRE_SELF_TEST_DEFAULT_CAPTURE_SECONDS"],
+              let seconds = Double(rawSeconds) else { return }
+        let outputURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["WIRE_SELF_TEST_OUTPUT"] ?? "/tmp/wire-default-capture-self-test.txt")
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            do {
+                try recorder.start()
+            } catch {
+                try? "started=false\nerror=\(error.localizedDescription)\n".write(to: outputURL, atomically: true, encoding: .utf8)
+                NSApp.terminate(nil)
+                return
+            }
+
+            try? await Task.sleep(nanoseconds: UInt64(max(0.2, seconds) * 1_000_000_000))
+            let data = recorder.stop()
+            let summary: String
+            if let data, let stats = wavStats(data) {
+                summary = """
+                started=true
+                bytes=\(data.count)
+                duration=\(String(format: "%.3f", stats.duration))
+                rms=\(String(format: "%.1f", stats.rms))
+                peak=\(stats.peak)
+
+                """
+            } else {
+                summary = "started=true\nbytes=\(data?.count ?? 0)\nduration=0.000\nrms=0.0\npeak=0\n"
+            }
+            try? summary.write(to: outputURL, atomically: true, encoding: .utf8)
+            NSApp.terminate(nil)
+        }
+    }
+
+    private func runHeadsetPathSelfTestIfRequested() {
+        guard ProcessInfo.processInfo.environment["WIRE_SELF_TEST_HEADSET_PATHS"] == "1" else { return }
+        let outputURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["WIRE_SELF_TEST_OUTPUT"] ?? "/tmp/wire-headset-path-self-test.txt")
+
+        Task { @MainActor in
+            selfTestTranscript = "synthetic transcript"
+            let audio = Self.syntheticSpeechLikeWavData(duration: 2.0)
+            let hold = await runSyntheticHeadsetPath(name: "hold") {
+                self.recorder.useSyntheticRecordingData(audio)
+                self.handleHeadsetHoldPressed()
+                await self.waitForSelfTestCondition { self.recorder.hasActiveRecording }
+                self.handleHeadsetHoldReleased()
+            }
+            let toggle = await runSyntheticHeadsetPath(name: "toggle") {
+                self.recorder.useSyntheticRecordingData(audio)
+                self.handleHeadsetTogglePressed()
+                await self.waitForSelfTestCondition { self.recorder.hasActiveRecording }
+                self.handleHeadsetTogglePressed()
+            }
+
+            let lines = [
+                "hold=\(hold)",
+                "toggle=\(toggle)",
+                "transcribeByteCounts=\(selfTestTranscribeByteCounts.map(String.init).joined(separator: ","))"
+            ]
+            try? (lines.joined(separator: "\n") + "\n").write(to: outputURL, atomically: true, encoding: .utf8)
+            NSApp.terminate(nil)
+        }
+    }
+
+    @MainActor
+    private func runSyntheticHeadsetPath(name: String, action: @escaping () async -> Void) async -> String {
+        state.statusText = "Self-testing \(name)"
+        state.transcriptionStage = .idle
+        state.isBusy = false
+        state.lastTranscription = ""
+        selfTestTranscribeByteCounts.removeAll()
+
+        await action()
+        await waitForSelfTestCondition {
+            !self.state.isBusy
+                && !self.recorder.hasActiveRecording
+                && self.state.transcriptionStage != .recording
+                && self.state.transcriptionStage != .transcribing
+        }
+
+        let stage: String
+        switch state.transcriptionStage {
+        case .idle: stage = "idle"
+        case .recording: stage = "recording"
+        case .transcribing: stage = "transcribing"
+        case .done: stage = "done"
+        case .error(let message): stage = "error:\(message)"
+        }
+        return "stage=\(stage) status=\(state.statusText) transcript=\(state.lastTranscription)"
+    }
+
+    @MainActor
+    private func waitForSelfTestCondition(_ condition: @escaping () -> Bool) async {
+        let deadline = Date().addingTimeInterval(5)
+        while !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    private static func syntheticSpeechLikeWavData(duration: Double) -> Data {
+        let sampleRate = 16_000
+        let sampleCount = max(1, Int(duration * Double(sampleRate)))
+        var pcm = Data(capacity: sampleCount * 2)
+        for index in 0..<sampleCount {
+            let t = Double(index) / Double(sampleRate)
+            let envelope = 0.55 + 0.35 * sin(2.0 * Double.pi * 3.0 * t)
+            let signal = sin(2.0 * Double.pi * 220.0 * t) + 0.35 * sin(2.0 * Double.pi * 440.0 * t)
+            let sample = Int16(max(-24_000, min(24_000, Int(signal * envelope * 10_000))))
+            var littleEndian = sample.littleEndian
+            withUnsafeBytes(of: &littleEndian) { pcm.append(contentsOf: $0) }
+        }
+
+        var data = Data()
+        data.append("RIFF".data(using: .ascii)!)
+        appendLittleEndianUInt32(UInt32(36 + pcm.count), to: &data)
+        data.append("WAVE".data(using: .ascii)!)
+        data.append("fmt ".data(using: .ascii)!)
+        appendLittleEndianUInt32(16, to: &data)
+        appendLittleEndianUInt16(1, to: &data)
+        appendLittleEndianUInt16(1, to: &data)
+        appendLittleEndianUInt32(UInt32(sampleRate), to: &data)
+        appendLittleEndianUInt32(UInt32(sampleRate * 2), to: &data)
+        appendLittleEndianUInt16(2, to: &data)
+        appendLittleEndianUInt16(16, to: &data)
+        data.append("data".data(using: .ascii)!)
+        appendLittleEndianUInt32(UInt32(pcm.count), to: &data)
+        data.append(pcm)
+        return data
+    }
+
+    private static func appendLittleEndianUInt16(_ value: UInt16, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    private static func appendLittleEndianUInt32(_ value: UInt32, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
     }
 
     private func initializeSession() async {
@@ -372,40 +567,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleToggleHotKeyPressed() {
-        handleTranscribe()
+        handleTranscribe(source: "keyboard-toggle")
     }
 
     private func handleHeadsetTogglePressed() {
-        handleTranscribe(sendReturnAfterPasteEligible: true)
+        handleTranscribe(sendReturnAfterPasteEligible: true, source: "headset-toggle")
     }
 
     private func handleAirPodsTogglePressed() {
-        handleTranscribe(useBuiltInInput: true, sendReturnAfterPasteEligible: true, startedByAirPods: true)
+        handleTranscribe(useBuiltInInput: true, sendReturnAfterPasteEligible: true, startedByAirPods: true, source: "airpods-toggle")
     }
 
     private func handleHoldHotKeyPressed() {
-        startRecording(status: "Recording… release hold shortcut to transcribe", kind: .hold)
+        startRecording(status: "Recording… release hold shortcut to transcribe", kind: .hold, source: "keyboard-hold")
     }
 
     private func handleHeadsetHoldPressed() {
-        startRecording(status: "Recording… release headset button to transcribe", kind: .hold, sendReturnAfterPasteEligible: true)
+        Self.appendHeadsetDebugLog("app hold-pressed")
+        startRecording(
+            status: "Recording… release headset button to transcribe",
+            kind: .hold,
+            sendReturnAfterPasteEligible: true,
+            startedByHeadsetHold: true,
+            source: "headset-hold"
+        )
     }
 
     private func handleHoldHotKeyReleased() {
-        guard recorder.hasActiveRecording, activeRecordingKind == .hold else { return }
-        stopAndTranscribe()
+        if recorder.hasActiveRecording, activeRecordingKind == .hold {
+            Self.appendHeadsetDebugLog("app hold-release stop active=true kind=hold")
+            stopAndTranscribe()
+        } else if holdRecordingStartPending {
+            Self.appendHeadsetDebugLog("app hold-release queued pending-start active=\(recorder.hasActiveRecording) kind=\(String(describing: activeRecordingKind))")
+            stopHoldWhenRecordingStarts = true
+        } else {
+            Self.appendHeadsetDebugLog("app hold-release ignored active=\(recorder.hasActiveRecording) kind=\(String(describing: activeRecordingKind)) pending=false")
+        }
     }
 
     private func handleHeadsetHoldReleased() {
-        handleHoldHotKeyReleased()
+        if recorder.hasActiveRecording {
+            Self.appendHeadsetDebugLog("app headset-hold-release stop active=true kind=\(String(describing: activeRecordingKind)) startedByHeadsetHold=\(activeRecordingStartedByHeadsetHold) source=\(activeRecordingSource)")
+            stopAndTranscribe()
+        } else {
+            handleHoldHotKeyReleased()
+        }
     }
 
     private func handleTranscribe(
         useBuiltInInput: Bool = false,
         sendReturnAfterPasteEligible: Bool = false,
-        startedByAirPods: Bool = false
+        startedByAirPods: Bool = false,
+        source: String
     ) {
         if recorder.hasActiveRecording {
+            Self.appendTranscriptionDebugLog("toggle-stop source=\(source) activeKind=\(String(describing: activeRecordingKind)) activeSource=\(activeRecordingSource)")
             stopAndTranscribe()
         } else {
             startRecording(
@@ -413,7 +629,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 kind: .toggle,
                 useBuiltInInput: useBuiltInInput,
                 sendReturnAfterPasteEligible: sendReturnAfterPasteEligible,
-                startedByAirPods: startedByAirPods
+                startedByAirPods: startedByAirPods,
+                source: source
             )
         }
     }
@@ -423,13 +640,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         kind: HotKeyKind,
         useBuiltInInput: Bool = false,
         sendReturnAfterPasteEligible: Bool = false,
-        startedByAirPods: Bool = false
+        startedByAirPods: Bool = false,
+        startedByHeadsetHold: Bool = false,
+        source: String
     ) {
+        if kind == .hold {
+            holdRecordingStartPending = true
+            stopHoldWhenRecordingStarts = false
+            Self.appendHeadsetDebugLog("app start-hold pending=true source=\(source)")
+        }
+
         Task { @MainActor in
-            guard !recorder.hasActiveRecording else { return }
-            guard state.transcriptionStage != .transcribing else { return }
+            guard !recorder.hasActiveRecording else {
+                Self.appendTranscriptionDebugLog("start ignored source=\(source) kind=\(kind) reason=already-active activeKind=\(String(describing: activeRecordingKind)) activeSource=\(activeRecordingSource)")
+                clearPendingHoldStartIfNeeded(kind: kind)
+                return
+            }
+            guard state.transcriptionStage != .transcribing else {
+                Self.appendTranscriptionDebugLog("start ignored source=\(source) kind=\(kind) reason=already-transcribing")
+                clearPendingHoldStartIfNeeded(kind: kind)
+                return
+            }
 
             guard await ensureMicrophonePermission() else {
+                clearPendingHoldStartIfNeeded(kind: kind)
                 state.statusText = "Enable Microphone permission for wire"
                 state.transcriptionStage = .error("Microphone permission missing")
                 state.isBusy = false
@@ -451,44 +685,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 activeRecordingKind = kind
                 activeRecordingShouldPressReturn = sendReturnAfterPasteEligible
                 activeRecordingStartedByAirPods = startedByAirPods
+                activeRecordingStartedByHeadsetHold = startedByHeadsetHold
+                activeRecordingSource = source
+                Self.appendTranscriptionDebugLog("start source=\(source) kind=\(kind) builtIn=\(useBuiltInInput) headsetHold=\(startedByHeadsetHold) airpods=\(startedByAirPods)")
+                let shouldStopImmediately = kind == .hold && stopHoldWhenRecordingStarts
+                if kind == .hold {
+                    Self.appendHeadsetDebugLog("app start-hold active=true stopImmediately=\(shouldStopImmediately) source=\(source)")
+                }
+                clearPendingHoldStartIfNeeded(kind: kind)
                 startRecordingStatusTimer()
+                if shouldStopImmediately {
+                    stopAndTranscribe()
+                }
             } catch {
+                clearPendingHoldStartIfNeeded(kind: kind)
                 state.statusText = "Could not start recording: \(error.localizedDescription)"
+                Self.appendTranscriptionDebugLog("start failed source=\(source) kind=\(kind) error=\(error.localizedDescription)")
                 state.transcriptionStage = .error(error.localizedDescription)
                 state.isBusy = false
             }
         }
     }
 
+    private func clearPendingHoldStartIfNeeded(kind: HotKeyKind) {
+        guard kind == .hold else { return }
+        holdRecordingStartPending = false
+        stopHoldWhenRecordingStarts = false
+    }
+
     private func stopAndTranscribe() {
         Task { @MainActor in
-            guard recorder.hasActiveRecording else { return }
+            guard recorder.hasActiveRecording else {
+                Self.appendTranscriptionDebugLog("stop ignored reason=no-active-recording kind=\(String(describing: activeRecordingKind))")
+                return
+            }
             state.statusText = "Loading… transcribing"
             state.transcriptionStage = .transcribing
 
             let audioData = recorder.stop()
             let shouldPressReturnAfterPaste = activeRecordingShouldPressReturn && state.sendEnterAfterPaste
             let wasStartedByAirPods = activeRecordingStartedByAirPods
+            let wasStartedByHeadsetHold = activeRecordingStartedByHeadsetHold
+            let stoppedRecordingKind = activeRecordingKind
+            let stoppedRecordingSource = activeRecordingSource
             stopRecordingStatusTimer()
             activeRecordingKind = nil
             activeRecordingShouldPressReturn = false
             activeRecordingStartedByAirPods = false
+            activeRecordingStartedByHeadsetHold = false
+            activeRecordingSource = ""
 
             guard let data = audioData, data.count > 1000 else {
+                Self.appendTranscriptionDebugLog("skip source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) reason=too-short bytes=\(audioData?.count ?? 0)")
                 state.statusText = "Recording too short, try again"
                 state.transcriptionStage = .error("Recording too short")
                 state.isBusy = false
                 return
             }
 
+            if let stats = wavStats(data) {
+                Self.appendTranscriptionDebugLog(
+                    "stop source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) bytes=\(data.count) duration=\(String(format: "%.3f", stats.duration)) rms=\(String(format: "%.1f", stats.rms)) peak=\(stats.peak) airpods=\(wasStartedByAirPods)"
+                )
+            } else {
+                Self.appendTranscriptionDebugLog("stop source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) bytes=\(data.count) stats=unavailable airpods=\(wasStartedByAirPods)")
+            }
+
             guard hasCapturedAudio(data) else {
+                Self.appendTranscriptionDebugLog("skip source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) reason=no-captured-audio bytes=\(data.count)")
                 state.statusText = "No microphone audio captured"
                 state.transcriptionStage = .error("No microphone audio captured")
                 state.isBusy = false
                 return
             }
 
-            guard wasStartedByAirPods || isLikelySpeechRecording(data) else {
+            let shouldAlwaysAttemptTranscription = wasStartedByAirPods || wasStartedByHeadsetHold || stoppedRecordingKind == .hold
+            guard shouldAlwaysAttemptTranscription || isLikelySpeechRecording(data) else {
+                Self.appendTranscriptionDebugLog("skip source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) reason=speech-gate bytes=\(data.count)")
                 state.statusText = "Ready"
                 state.transcriptionStage = .idle
                 state.isBusy = false
@@ -503,6 +776,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 state.lastTranscription = text
                 state.transcriptionStage = .done
                 state.statusText = "Done"
+                Self.appendTranscriptionDebugLog("done source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) textChars=\(text.count)")
 
                 let pasteboard = NSPasteboard.general
                 pasteboard.clearContents()
@@ -512,6 +786,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     typeText(text, pressReturnAfterPaste: shouldPressReturnAfterPaste)
                 }
             } catch {
+                Self.appendTranscriptionDebugLog("error source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) error=\(error.localizedDescription)")
                 if isASRBackendFailure(error) {
                     state.statusText = "Error: speech recognition failed. Try again."
                     state.transcriptionStage = .error("Speech recognition failed")
@@ -525,6 +800,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func transcribe(_ data: Data, retryASRFailure: Bool) async throws -> String {
+        if let selfTestTranscript {
+            selfTestTranscribeByteCounts.append(data.count)
+            return selfTestTranscript
+        }
+
         do {
             return try await codexClient.transcribe(audioData: data)
         } catch {
@@ -1187,6 +1467,13 @@ final class HeadsetProbeManager {
         let target: Any
     }
 
+    private struct InputReportRegistration {
+        let device: IOHIDDevice
+        let buffer: UnsafeMutablePointer<UInt8>
+        let length: CFIndex
+        let scheduled: Bool
+    }
+
     private static let modeDefaultsKey = "headsetButtonMode"
     private static let airPodsControlDefaultsKey = "airPodsMacMicControlEnabled"
     private static let playPauseUsage: UInt32 = 0xcd
@@ -1200,6 +1487,7 @@ final class HeadsetProbeManager {
     private let onHoldReleased: () -> Void
     private let isRecording: () -> Bool
     private var hidManager: IOHIDManager?
+    private var inputReportRegistrations: [InputReportRegistration] = []
     private var remoteCommandTargets: [RemoteCommandTarget] = []
     private var airPodsProbeEngine: AVAudioEngine?
     private var airPodsProbePlayer: AVAudioPlayerNode?
@@ -1210,21 +1498,17 @@ final class HeadsetProbeManager {
     private var lastAirPodsToggleAt: Date?
     private var headsetPressStartedAt: Date?
     private var longPressWorkItem: DispatchWorkItem?
+    private var playPauseElement: IOHIDElement?
+    private var playPauseReleasePollTimer: Timer?
+    private var lastInputReportPlayPauseValue: UInt8 = 0
     private var longPressActive = false
 
+    private static func appendHeadsetDebugLog(_ message: String) {
+        DebugLog.append(message, to: "/tmp/wire-headset.log")
+    }
+
     private static func appendAirPodsDebugLog(_ message: String) {
-        let formatter = ISO8601DateFormatter()
-        let line = "\(formatter.string(from: Date())) \(message)\n"
-        let url = URL(fileURLWithPath: "/tmp/wire-airpods-remote.log")
-        guard let data = line.data(using: .utf8) else { return }
-        if FileManager.default.fileExists(atPath: url.path),
-           let handle = try? FileHandle(forWritingTo: url) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-            try? handle.close()
-        } else {
-            try? data.write(to: url)
-        }
+        DebugLog.append(message, to: "/tmp/wire-airpods-remote.log")
     }
 
     init(
@@ -1270,6 +1554,7 @@ final class HeadsetProbeManager {
 
     func setControlsEnabled(_ enabled: Bool) {
         controlsEnabled = enabled
+        Self.appendHeadsetDebugLog("controls enabled=\(enabled)")
         if enabled {
             start()
         } else {
@@ -1310,12 +1595,14 @@ final class HeadsetProbeManager {
 
     func start() {
         guard controlsEnabled else { return }
+        Self.appendHeadsetDebugLog("controls start")
         installHIDControl()
         syncRemoteCommandProbe()
     }
 
     func stop() {
         cancelPendingLongPress()
+        stopPlayPauseReleasePolling()
         removeRemoteCommandProbe()
         removeHIDControl()
     }
@@ -1326,11 +1613,10 @@ final class HeadsetProbeManager {
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         let matches: [[String: Any]] = [
             [
-                kIOHIDDeviceUsagePageKey as String: kHIDPage_Consumer
-            ],
-            [
-                kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
-                kIOHIDDeviceUsageKey as String: kHIDUsage_GD_SystemControl
+                kIOHIDDeviceUsagePageKey as String: kHIDPage_Consumer,
+                kIOHIDDeviceUsageKey as String: kHIDUsage_Csmr_ConsumerControl,
+                kIOHIDProductKey as String: "Headset",
+                kIOHIDTransportKey as String: "Audio"
             ]
         ]
 
@@ -1343,10 +1629,77 @@ final class HeadsetProbeManager {
             manager.handleHIDValue(value)
         }, context)
 
+        IOHIDManagerRegisterInputReportCallback(manager, { context, result, sender, type, reportID, report, reportLength in
+            guard let context else { return }
+            let manager = Unmanaged<HeadsetProbeManager>.fromOpaque(context).takeUnretainedValue()
+            manager.handleHIDInputReport(
+                result: result,
+                sender: sender,
+                type: type,
+                reportID: reportID,
+                report: report,
+                reportLength: reportLength
+            )
+        }, context)
+
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         let openOptions = IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
-        IOHIDManagerOpen(manager, openOptions)
+        var result = IOHIDManagerOpen(manager, openOptions)
+        Self.appendHeadsetDebugLog("hid open seize result=\(result)")
+        if result != kIOReturnSuccess {
+            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+            result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+            Self.appendHeadsetDebugLog("hid open fallback result=\(result)")
+        }
+        logMatchedHIDDevices(manager)
+        installInputReportCallbacks(manager)
         hidManager = manager
+    }
+
+    private func logMatchedHIDDevices(_ manager: IOHIDManager) {
+        guard let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else {
+            Self.appendHeadsetDebugLog("hid devices=none")
+            return
+        }
+
+        for device in devices {
+            let product = Self.hidStringProperty(device, kIOHIDProductKey) ?? "unknown"
+            let transport = Self.hidStringProperty(device, kIOHIDTransportKey) ?? "unknown"
+            let builtIn = Self.isBuiltInHIDDevice(device)
+            let usagePage = Self.hidIntProperty(device, kIOHIDPrimaryUsagePageKey)
+            let usage = Self.hidIntProperty(device, kIOHIDPrimaryUsageKey)
+            Self.appendHeadsetDebugLog("hid device product=\(product) transport=\(transport) builtIn=\(builtIn) usagePage=\(usagePage) usage=\(usage)")
+        }
+    }
+
+    private func installInputReportCallbacks(_ manager: IOHIDManager) {
+        guard let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else {
+            Self.appendHeadsetDebugLog("hid report callbacks skipped reason=no-devices")
+            return
+        }
+
+        for device in devices where Self.isWiredHeadsetHIDDevice(device) {
+            let maxReportSize = max(1, Self.hidIntProperty(device, kIOHIDMaxInputReportSizeKey))
+            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: maxReportSize)
+            buffer.initialize(repeating: 0, count: maxReportSize)
+            let context = Unmanaged.passUnretained(self).toOpaque()
+            IOHIDDeviceRegisterInputReportCallback(device, buffer, CFIndex(maxReportSize), { context, result, sender, type, reportID, report, reportLength in
+                guard let context else { return }
+                let manager = Unmanaged<HeadsetProbeManager>.fromOpaque(context).takeUnretainedValue()
+                manager.handleHIDInputReport(
+                    result: result,
+                    sender: sender,
+                    type: type,
+                    reportID: reportID,
+                    report: report,
+                    reportLength: reportLength
+                )
+            }, context)
+            IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            inputReportRegistrations.append(InputReportRegistration(device: device, buffer: buffer, length: CFIndex(maxReportSize), scheduled: true))
+            let product = Self.hidStringProperty(device, kIOHIDProductKey) ?? "unknown"
+            Self.appendHeadsetDebugLog("hid report callback installed product=\(product) maxReportSize=\(maxReportSize) scheduled=true")
+        }
     }
 
     private func removeHIDControl() {
@@ -1354,6 +1707,13 @@ final class HeadsetProbeManager {
         IOHIDManagerUnscheduleFromRunLoop(hidManager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDManagerClose(hidManager, IOOptionBits(kIOHIDOptionsTypeNone))
         self.hidManager = nil
+        for registration in inputReportRegistrations {
+            if registration.scheduled {
+                IOHIDDeviceUnscheduleFromRunLoop(registration.device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            }
+            registration.buffer.deallocate()
+        }
+        inputReportRegistrations.removeAll()
     }
 
     private func syncRemoteCommandProbe() {
@@ -1366,8 +1726,10 @@ final class HeadsetProbeManager {
 
     private func installRemoteCommandProbe() {
         guard remoteCommandTargets.isEmpty else { return }
-        startSilentAirPodsProbeAudio()
-        publishAirPodsProbeNowPlaying()
+        if airPodsControlEnabled {
+            startSilentAirPodsProbeAudio()
+            publishAirPodsProbeNowPlaying()
+        }
         let center = MPRemoteCommandCenter.shared()
         let commands: [(String, MPRemoteCommand)] = [
             ("remote play", center.playCommand),
@@ -1390,6 +1752,7 @@ final class HeadsetProbeManager {
             }
             remoteCommandTargets.append(RemoteCommandTarget(command: command, target: target))
         }
+        Self.appendHeadsetDebugLog("remote commands installed count=\(remoteCommandTargets.count)")
         startAirPodsNowPlayingTimer()
     }
 
@@ -1528,37 +1891,137 @@ final class HeadsetProbeManager {
         center.nowPlayingInfo = nil
     }
 
+    private func handleHIDInputReport(
+        result: IOReturn,
+        sender: UnsafeMutableRawPointer?,
+        type: IOHIDReportType,
+        reportID: UInt32,
+        report: UnsafeMutablePointer<UInt8>?,
+        reportLength: CFIndex
+    ) {
+        guard result == kIOReturnSuccess else {
+            Self.appendHeadsetDebugLog("hid report result=\(result) reportID=\(reportID) length=\(reportLength)")
+            return
+        }
+        guard let report, reportLength > 0 else {
+            Self.appendHeadsetDebugLog("hid report empty reportID=\(reportID) length=\(reportLength)")
+            return
+        }
+
+        let bytes = Array(UnsafeBufferPointer(start: report, count: Int(reportLength)))
+        let firstByte = bytes.first ?? 0
+        let playPauseValue = firstByte & 0x01
+        let hexBytes = bytes.map { String(format: "%02x", $0) }.joined(separator: "")
+        Self.appendHeadsetDebugLog("hid report type=\(type.rawValue) reportID=\(reportID) length=\(reportLength) bytes=\(hexBytes) playPause=\(playPauseValue)")
+
+        guard playPauseValue != lastInputReportPlayPauseValue else {
+            Self.appendHeadsetDebugLog("hid report ignored reason=playpause-unchanged value=\(playPauseValue)")
+            return
+        }
+
+        lastInputReportPlayPauseValue = playPauseValue
+        handlePlayPauseValue(CFIndex(playPauseValue))
+    }
+
     private func handleHIDValue(_ value: IOHIDValue) {
         let element = IOHIDValueGetElement(value)
+        let device = IOHIDElementGetDevice(element)
+        guard !Self.isBuiltInHIDDevice(device) else {
+            return
+        }
         let usagePage = IOHIDElementGetUsagePage(element)
         let usage = IOHIDElementGetUsage(element)
         let intValue = IOHIDValueGetIntegerValue(value)
-        guard usagePage == kHIDPage_Consumer else { return }
-        if usage == Self.playPauseUsage {
+        let product = Self.hidStringProperty(device, kIOHIDProductKey) ?? "unknown"
+        let transport = Self.hidStringProperty(device, kIOHIDTransportKey) ?? "unknown"
+        Self.appendHeadsetDebugLog("hid value product=\(product) transport=\(transport) usagePage=\(usagePage) usage=\(usage) value=\(intValue) pressStarted=\(headsetPressStartedAt != nil) longActive=\(longPressActive) recording=\(isRecording())")
+
+        if Self.isWiredHeadsetHIDDevice(device), usagePage == kHIDPage_Consumer {
+            if usage == Self.nextTrackUsage, intValue != 0, airPodsControlEnabled {
+                Self.appendAirPodsDebugLog("hid usage=nextTrack recording=\(isRecording())")
+                handleAirPodsRemoteCommand("hid nextTrack")
+                return
+            }
+            guard usage == Self.playPauseUsage else {
+                Self.appendHeadsetDebugLog("hid ignored reason=wired-headset-non-playpause usage=\(usage) value=\(intValue)")
+                return
+            }
+            playPauseElement = element
             handlePlayPauseValue(intValue)
-        } else if usage == Self.nextTrackUsage, intValue != 0 {
-            Self.appendAirPodsDebugLog("hid usage=nextTrack recording=\(isRecording())")
-            handleAirPodsRemoteCommand("hid nextTrack")
+            return
         }
+
+        Self.appendHeadsetDebugLog("hid ignored reason=not-wired-headset product=\(product) transport=\(transport) usagePage=\(usagePage) usage=\(usage)")
+    }
+
+    private static func isBuiltInHIDDevice(_ device: IOHIDDevice) -> Bool {
+        if let builtIn = IOHIDDeviceGetProperty(device, kIOHIDBuiltInKey as CFString) {
+            if CFGetTypeID(builtIn) == CFBooleanGetTypeID() {
+                return CFBooleanGetValue((builtIn as! CFBoolean))
+            }
+            if let number = builtIn as? NSNumber {
+                return number.boolValue
+            }
+        }
+        let product = (IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String ?? "").lowercased()
+        return product.contains("internal keyboard")
+            || product.contains("apple internal")
+            || product.contains("applem68buttons")
+    }
+
+    private static func isWiredHeadsetHIDDevice(_ device: IOHIDDevice) -> Bool {
+        let product = (hidStringProperty(device, kIOHIDProductKey) ?? "").lowercased()
+        let transport = (hidStringProperty(device, kIOHIDTransportKey) ?? "").lowercased()
+        return product.contains("headset") || transport == "audio"
+    }
+
+    private static func hidStringProperty(_ device: IOHIDDevice, _ key: String) -> String? {
+        IOHIDDeviceGetProperty(device, key as CFString) as? String
+    }
+
+    private static func hidIntProperty(_ device: IOHIDDevice, _ key: String) -> Int {
+        guard let value = IOHIDDeviceGetProperty(device, key as CFString) else {
+            return -1
+        }
+        if CFGetTypeID(value) == CFNumberGetTypeID() {
+            return (value as! NSNumber).intValue
+        }
+        return -1
     }
 
     private func handlePlayPauseValue(_ value: CFIndex) {
         if value != 0 {
+            if headsetPressStartedAt != nil {
+                if longPressActive && mode == .longPressHold {
+                    Self.appendHeadsetDebugLog("hid nonzero-after-active treated-as-release")
+                    stopActiveHold()
+                } else {
+                    Self.appendHeadsetDebugLog("hid repeat-down ignored")
+                }
+                return
+            }
+
+            Self.appendHeadsetDebugLog("hid press-start schedule-long threshold=\(Self.longPressThreshold)")
             headsetPressStartedAt = Date()
             longPressActive = false
             longPressWorkItem?.cancel()
+            startPlayPauseReleasePolling()
             let workItem = DispatchWorkItem { [weak self] in
                 self?.activateLongPressIfStillDown()
             }
             longPressWorkItem = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.longPressThreshold, execute: workItem)
         } else {
-            let shouldStopHold = longPressActive && mode == .longPressHold
-            cancelPendingLongPress()
-            if shouldStopHold {
-                DispatchQueue.main.async { [onHoldReleased] in
-                    onHoldReleased()
-                }
+            if longPressActive && mode == .longPressHold {
+                Self.appendHeadsetDebugLog("hid zero-release stop-active-hold")
+                stopActiveHold()
+            } else if mode == .longPressHold && pressDurationHasReachedLongThreshold() {
+                Self.appendHeadsetDebugLog("hid zero-release after-threshold activate-and-stop")
+                activateLongPressIfStillDown()
+                stopActiveHold()
+            } else {
+                Self.appendHeadsetDebugLog("hid zero-release cancel-before-active")
+                cancelPendingLongPress()
             }
         }
     }
@@ -1566,6 +2029,7 @@ final class HeadsetProbeManager {
     private func activateLongPressIfStillDown() {
         guard headsetPressStartedAt != nil, mode.controlsWiredRecording, !longPressActive else { return }
         longPressActive = true
+        Self.appendHeadsetDebugLog("hid long-press-activated mode=\(mode)")
 
         switch mode {
         case .longPressHold:
@@ -1575,11 +2039,38 @@ final class HeadsetProbeManager {
         }
     }
 
+    private func stopActiveHold() {
+        Self.appendHeadsetDebugLog("hid stop-active-hold dispatch-release")
+        cancelPendingLongPress()
+        DispatchQueue.main.async { [onHoldReleased] in
+            onHoldReleased()
+        }
+    }
+
     private func cancelPendingLongPress() {
         longPressWorkItem?.cancel()
         longPressWorkItem = nil
         headsetPressStartedAt = nil
         longPressActive = false
+        stopPlayPauseReleasePolling()
+    }
+
+    private func startPlayPauseReleasePolling() {
+        Self.appendHeadsetDebugLog("hid poll disabled reason=raw-report-callback")
+    }
+
+    private func stopPlayPauseReleasePolling() {
+        playPauseReleasePollTimer?.invalidate()
+        playPauseReleasePollTimer = nil
+    }
+
+    private func pollPlayPauseRelease() {
+        Self.appendHeadsetDebugLog("hid poll ignored reason=disabled")
+    }
+
+    private func pressDurationHasReachedLongThreshold() -> Bool {
+        guard let headsetPressStartedAt else { return false }
+        return Date().timeIntervalSince(headsetPressStartedAt) >= Self.longPressThreshold
     }
 }
 
@@ -1595,30 +2086,31 @@ final class AudioRecorder: NSObject {
     private var audioQueueFormat = AudioStreamBasicDescription()
     private var audioQueuePacketIndex: Int64 = 0
     private var audioQueueIsRunning = false
+    private var nextSyntheticRecordingData: Data?
+    private var activeSyntheticRecordingData: Data?
 
     private static func appendRecorderDebugLog(_ message: String) {
-        let formatter = ISO8601DateFormatter()
-        let line = "\(formatter.string(from: Date())) \(message)\n"
-        let url = URL(fileURLWithPath: "/tmp/wire-recorder.log")
-        guard let data = line.data(using: .utf8) else { return }
-        if FileManager.default.fileExists(atPath: url.path),
-           let handle = try? FileHandle(forWritingTo: url) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-            try? handle.close()
-        } else {
-            try? data.write(to: url)
-        }
+        DebugLog.append(message, to: "/tmp/wire-recorder.log")
     }
 
     var isRecording: Bool { engine?.isRunning ?? false }
     var hasActiveRecording: Bool {
-        (engine != nil && tempURL != nil) || audioQueue != nil
+        activeSyntheticRecordingData != nil || (engine != nil && tempURL != nil) || audioQueue != nil
+    }
+
+    func useSyntheticRecordingData(_ data: Data) {
+        nextSyntheticRecordingData = data
     }
 
     /// Start recording to a temporary WAV file
     func start(inputDeviceID: AudioDeviceID? = nil) throws {
         guard !hasActiveRecording else { return }
+        if let nextSyntheticRecordingData {
+            activeSyntheticRecordingData = nextSyntheticRecordingData
+            self.nextSyntheticRecordingData = nil
+            Self.appendRecorderDebugLog("start-synthetic bytes=\(nextSyntheticRecordingData.count)")
+            return
+        }
         if inputDeviceID != nil {
             try startBuiltInMicCapture()
             return
@@ -1628,6 +2120,7 @@ final class AudioRecorder: NSObject {
         self.engine = engine
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
+        Self.appendRecorderDebugLog("start-default deviceName=\(Self.defaultInputDeviceName()) sampleRate=\(format.sampleRate) channels=\(format.channelCount)")
 
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -1647,6 +2140,39 @@ final class AudioRecorder: NSObject {
 
         engine.prepare()
         try engine.start()
+    }
+
+    private static func defaultInputDeviceName() -> String {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        ) == noErr else {
+            return "unknown"
+        }
+
+        var nameAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var name: Unmanaged<CFString>?
+        size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(deviceID, &nameAddress, 0, nil, &size, &name) == noErr,
+              let name else {
+            return "device-\(deviceID)"
+        }
+        return name.takeUnretainedValue() as String
     }
 
     private func startBuiltInMicCapture() throws {
@@ -1774,6 +2300,10 @@ final class AudioRecorder: NSObject {
 
     /// Stop recording and return the audio data
     private func stopAndTranscribe() -> Data? {
+        if let activeSyntheticRecordingData {
+            self.activeSyntheticRecordingData = nil
+            return activeSyntheticRecordingData
+        }
         if audioQueue != nil || audioQueueFile != nil {
             return stopBuiltInMicCapture()
         }
@@ -3343,6 +3873,6 @@ final class HotKeyManager {
 
 extension AppDelegate {
     @objc func handleTranscribeObjc() {
-        handleTranscribe()
+        handleTranscribe(source: "objc-toggle")
     }
 }
