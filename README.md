@@ -46,8 +46,8 @@ and opens it. If `/Applications` requires admin rights, the script will ask via 
 - Click either shortcut button to reset it. While recording a new shortcut, the button shows `Listening…`, then updates live as you press modifiers/keys (for example `⌘⇧M`). It saves when all keys are released; press `Esc` to cancel.
 - **Headset controls** can be disabled with one switch. When disabled, wired headset controls, AirPods controls, and headset-only Return-after-paste are all inactive.
 - Wired headset button modes are **Long hold to dictate** and **Long press to toggle**.
-- **AirPods controls (experimental)** maps the AirPods left-tap / next-track control to start/stop recording. It records from the Mac microphone, not the AirPods microphone, and may interfere with music controls.
-- **Press Return after paste** sends Return only after transcripts started from wired headset or AirPods controls.
+- **AirPods controls (experimental)** maps the AirPods left-tap / next-track control to start or continue recording from the AirPods microphone when available. Since AirPods media taps are not reliable while that microphone is active, `wire` auto-stops after a short silence. Right tap / play-pause submits with Return when not recording.
+- **Wired sends Return** sends Return only after transcripts started from the wired headset button.
 - The latest transcript appears in the popover, with a copy button beside it.
 - Transcripts are always copied to the clipboard. If Accessibility permission is granted, `wire` also pastes the transcript into the active app.
 - On launch, `wire` attempts to register itself as a login item so it starts automatically when you log in.
