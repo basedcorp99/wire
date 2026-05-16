@@ -66,6 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let computerControlsEnabledDefaultsKey = "computerControlsEnabled"
     private static let computerAutoEnableEnabledDefaultsKey = "computerAutoEnableEnabled"
     private static let computerAutoEnablePhraseDefaultsKey = "computerAutoEnablePhrase"
+    private static let computerAutoDisablePhraseDefaultsKey = "computerAutoDisablePhrase"
     private static let computerCustomHarnessEnabledDefaultsKey = "computerCustomHarnessEnabled"
     private static let computerHarnessCommandDefaultsKey = "computerHarnessCommand"
     private static let defaultComputerHarnessCommand = "codex --yolo -c 'model_reasoning_effort=\"low\"' e {{prompt}}"
@@ -96,6 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.computerControlsEnabled = UserDefaults.standard.bool(forKey: Self.computerControlsEnabledDefaultsKey)
         state.computerAutoEnableEnabled = UserDefaults.standard.bool(forKey: Self.computerAutoEnableEnabledDefaultsKey)
         state.computerAutoEnablePhrase = UserDefaults.standard.string(forKey: Self.computerAutoEnablePhraseDefaultsKey) ?? ""
+        state.computerAutoDisablePhrase = UserDefaults.standard.string(forKey: Self.computerAutoDisablePhraseDefaultsKey) ?? ""
         state.computerCustomHarnessEnabled = UserDefaults.standard.bool(forKey: Self.computerCustomHarnessEnabledDefaultsKey)
         state.computerHarnessCommand = UserDefaults.standard.string(forKey: Self.computerHarnessCommandDefaultsKey) ?? Self.defaultComputerHarnessCommand
 
@@ -738,6 +740,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
 
+        let disablePhrase = state.computerAutoDisablePhrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        if state.computerAutoEnableEnabled,
+           normalizedPhrase(disablePhrase).split(separator: " ").count >= 2,
+           fuzzyMatches(text, disablePhrase) {
+            setComputerControlsEnabled(false)
+            state.statusText = "Computer mode disabled"
+            showMenuBarFeedback("Mode off")
+            return true
+        }
+
         executeComputerPrompt(text)
         return true
     }
@@ -911,6 +923,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : "Auto enable phrase saved"
     }
 
+    func setComputerAutoDisablePhrase(_ phrase: String) {
+        UserDefaults.standard.set(phrase, forKey: Self.computerAutoDisablePhraseDefaultsKey)
+        state.computerAutoDisablePhrase = phrase
+        state.statusText = phrase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Auto disable phrase cleared"
+            : "Auto disable phrase saved"
+    }
+
     func setComputerCustomHarnessEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: Self.computerCustomHarnessEnabledDefaultsKey)
         state.computerCustomHarnessEnabled = enabled
@@ -965,6 +985,7 @@ final class AppState {
     var computerControlsEnabled = false { didSet { onChange?() } }
     var computerAutoEnableEnabled = false { didSet { onChange?() } }
     var computerAutoEnablePhrase = "" { didSet { onChange?() } }
+    var computerAutoDisablePhrase = "" { didSet { onChange?() } }
     var computerCustomHarnessEnabled = false { didSet { onChange?() } }
     var computerHarnessCommand = "" { didSet { onChange?() } }
     var computerCommandRunning = false { didSet { onChange?() } }
@@ -2154,6 +2175,10 @@ final class HoverMenuButton: NSButton {
     }
 }
 
+final class FlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private enum Layout {
         static let width: CGFloat = 300
@@ -2162,6 +2187,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private let state: AppState
     private let hotKeyManager: HotKeyManager
     private let headsetProbeManager: HeadsetProbeManager
+    private let scrollView = NSScrollView()
     private let rootStack = NSStackView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let toggleShortcutButton = NSButton(title: "", target: nil, action: nil)
@@ -2177,6 +2203,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private let computerHarnessInfoButton = NSButton(title: "", target: nil, action: nil)
     private let computerAutoEnableSwitch = NSSwitch()
     private let computerAutoEnableField = NSTextField(string: "")
+    private let computerAutoDisableField = NSTextField(string: "")
     private let computerHarnessField = NSTextField(string: "")
     private let transcriptLabel = NSTextField(labelWithString: "No recent transcription")
     private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
@@ -2196,6 +2223,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private var shortcutCaptureCurrentModifiers: UInt32 = 0
     private var shortcutCapturePressedKeyCodes = Set<UInt16>()
     private var computerAutoEnableSaveWorkItem: DispatchWorkItem?
+    private var computerAutoDisableSaveWorkItem: DispatchWorkItem?
     private var computerHarnessSaveWorkItem: DispatchWorkItem?
 
     init(state: AppState, hotKeyManager: HotKeyManager, headsetProbeManager: HeadsetProbeManager) {
@@ -2220,16 +2248,40 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     }
 
     private func buildUI() {
+        scrollView.drawsBackground = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(scrollView)
+
+        let documentView = FlippedDocumentView()
+        documentView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = documentView
+
         rootStack.orientation = .vertical
         rootStack.spacing = 0
         rootStack.detachesHiddenViews = true
         rootStack.edgeInsets = NSEdgeInsets(top: 8, left: 0, bottom: 6, right: 0)
         rootStack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(rootStack)
+        documentView.addSubview(rootStack)
         NSLayoutConstraint.activate([
-            rootStack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            rootStack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            rootStack.topAnchor.constraint(equalTo: view.topAnchor)
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+            documentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            documentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+            documentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            documentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            documentView.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor),
+
+            rootStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
+            rootStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
+            rootStack.topAnchor.constraint(equalTo: documentView.topAnchor),
+            rootStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor)
         ])
 
         let header = NSStackView()
@@ -2411,13 +2463,27 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         computerAutoEnableField.widthAnchor.constraint(equalToConstant: 142).isActive = true
         computerAutoEnableField.heightAnchor.constraint(equalToConstant: 26).isActive = true
 
-        let phraseRow = menuRow(symbol: "text.cursor", title: "Phrase", trailing: computerAutoEnableField)
-        rootStack.addArrangedSubview(phraseRow)
+        let enablePhraseRow = menuRow(symbol: "text.cursor", title: "Enable phrase", trailing: computerAutoEnableField)
+        rootStack.addArrangedSubview(enablePhraseRow)
+
+        computerAutoDisableField.placeholderString = "At least two words"
+        computerAutoDisableField.font = .systemFont(ofSize: 12)
+        computerAutoDisableField.bezelStyle = .roundedBezel
+        computerAutoDisableField.focusRingType = .none
+        computerAutoDisableField.controlSize = .small
+        computerAutoDisableField.delegate = self
+        computerAutoDisableField.target = self
+        computerAutoDisableField.action = #selector(updateComputerAutoDisablePhrase)
+        computerAutoDisableField.widthAnchor.constraint(equalToConstant: 142).isActive = true
+        computerAutoDisableField.heightAnchor.constraint(equalToConstant: 26).isActive = true
+
+        let disablePhraseRow = menuRow(symbol: "text.cursor", title: "Disable phrase", trailing: computerAutoDisableField)
+        rootStack.addArrangedSubview(disablePhraseRow)
         let computerBottomSpacer = spacer(height: 9)
         rootStack.addArrangedSubview(computerBottomSpacer)
         computerModeRows = [customHarnessToggleRow]
         computerHarnessRows = [commandRow]
-        computerAutoEnableRows = [phraseRow]
+        computerAutoEnableRows = [enablePhraseRow, disablePhraseRow]
 
         rootStack.addArrangedSubview(divider())
         rootStack.addArrangedSubview(clickableMenuRow(symbol: "power", title: "Quit", action: #selector(quitApp), destructive: true))
@@ -2556,11 +2622,20 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             let autoEnablePhrase = self.computerAutoEnableField.currentEditor() == nil
                 ? self.state.computerAutoEnablePhrase
                 : self.computerAutoEnableField.stringValue
+            let autoDisablePhrase = self.computerAutoDisableField.currentEditor() == nil
+                ? self.state.computerAutoDisablePhrase
+                : self.computerAutoDisableField.stringValue
             let hasInvalidAutoEnablePhrase = self.state.computerAutoEnableEnabled && self.autoEnablePhraseWordCount(autoEnablePhrase) < 2
+            let hasInvalidAutoDisablePhrase = self.state.computerAutoEnableEnabled
+                && !autoDisablePhrase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && self.autoEnablePhraseWordCount(autoDisablePhrase) < 2
+            let hasInvalidAutoPhrase = hasInvalidAutoEnablePhrase || hasInvalidAutoDisablePhrase
             self.statusLabel.stringValue = hasInvalidAutoEnablePhrase
                 ? "Minimum 2 words"
+                : hasInvalidAutoDisablePhrase
+                ? "Disable phrase needs 2 words"
                 : (self.state.statusText.isEmpty ? "Ready" : self.state.statusText)
-            self.statusLabel.textColor = hasInvalidAutoEnablePhrase ? .systemRed : .secondaryLabelColor
+            self.statusLabel.textColor = hasInvalidAutoPhrase ? .systemRed : .secondaryLabelColor
             if self.shortcutCaptureTarget == nil {
                 self.holdShortcutButton.title = self.hotKeyManager.holdShortcutDisplay
                 self.toggleShortcutButton.title = self.hotKeyManager.toggleShortcutDisplay
@@ -2596,6 +2671,9 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             self.computerAutoEnableSwitch.state = self.state.computerAutoEnableEnabled ? .on : .off
             if self.computerAutoEnableField.currentEditor() == nil {
                 self.computerAutoEnableField.stringValue = self.state.computerAutoEnablePhrase
+            }
+            if self.computerAutoDisableField.currentEditor() == nil {
+                self.computerAutoDisableField.stringValue = self.state.computerAutoDisablePhrase
             }
             if self.computerHarnessField.currentEditor() == nil {
                 self.computerHarnessField.stringValue = self.state.computerHarnessCommand
@@ -2636,8 +2714,19 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         view.layoutSubtreeIfNeeded()
         rootStack.layoutSubtreeIfNeeded()
 
-        let height = ceil(rootStack.fittingSize.height)
+        let contentHeight = ceil(rootStack.fittingSize.height)
+        let maxHeight = maxPopoverHeight()
+        let height = min(contentHeight, maxHeight)
         preferredContentSize = NSSize(width: Layout.width, height: height)
+    }
+
+    private func maxPopoverHeight() -> CGFloat {
+        let mouseLocation = NSEvent.mouseLocation
+        let screen = view.window?.screen
+            ?? NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
+            ?? NSScreen.main
+        let visibleHeight = screen?.visibleFrame.height ?? 720
+        return max(360, floor(visibleHeight - 72))
     }
 
     private func autoEnablePhraseWordCount(_ phrase: String) -> Int {
@@ -2745,6 +2834,13 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         refresh()
     }
 
+    @objc private func updateComputerAutoDisablePhrase() {
+        computerAutoDisableSaveWorkItem?.cancel()
+        (NSApp.delegate as? AppDelegate)?.setComputerAutoDisablePhrase(computerAutoDisableField.stringValue)
+        view.window?.makeFirstResponder(nil)
+        refresh()
+    }
+
     @objc private func updateComputerHarnessCommand() {
         computerHarnessSaveWorkItem?.cancel()
         (NSApp.delegate as? AppDelegate)?.setComputerHarnessCommand(computerHarnessField.stringValue)
@@ -2755,6 +2851,8 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     func controlTextDidEndEditing(_ obj: Notification) {
         if obj.object as? NSTextField === computerAutoEnableField {
             updateComputerAutoEnablePhrase()
+        } else if obj.object as? NSTextField === computerAutoDisableField {
+            updateComputerAutoDisablePhrase()
         } else if obj.object as? NSTextField === computerHarnessField {
             updateComputerHarnessCommand()
         }
@@ -2763,6 +2861,9 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     func controlTextDidChange(_ obj: Notification) {
         if obj.object as? NSTextField === computerAutoEnableField {
             scheduleComputerAutoEnablePhraseSave()
+            refresh()
+        } else if obj.object as? NSTextField === computerAutoDisableField {
+            scheduleComputerAutoDisablePhraseSave()
             refresh()
         } else if obj.object as? NSTextField === computerHarnessField {
             scheduleComputerHarnessCommandSave()
@@ -2777,6 +2878,16 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             (NSApp.delegate as? AppDelegate)?.setComputerAutoEnablePhrase(self.computerAutoEnableField.stringValue)
         }
         computerAutoEnableSaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+    }
+
+    private func scheduleComputerAutoDisablePhraseSave() {
+        computerAutoDisableSaveWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            (NSApp.delegate as? AppDelegate)?.setComputerAutoDisablePhrase(self.computerAutoDisableField.stringValue)
+        }
+        computerAutoDisableSaveWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
     }
 
@@ -2796,7 +2907,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             return
         }
 
-        let label = NSTextField(labelWithString: "When Computer mode is on, each transcript runs through a local shell command with full execution permissions.\nBy default it runs Codex with low reasoning effort.\nAuto enable only works when its switch is on and the phrase has at least two words.")
+        let label = NSTextField(labelWithString: "When Computer mode is on, each transcript runs through a local shell command with full execution permissions.\nBy default it runs Codex with low reasoning effort.\nAuto enable listens for the enable phrase when mode is off, and the disable phrase when mode is on.")
         label.font = .systemFont(ofSize: 12)
         label.textColor = .labelColor
         label.lineBreakMode = .byWordWrapping
