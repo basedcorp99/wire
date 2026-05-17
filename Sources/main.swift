@@ -125,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recordingStartedAt: Date?
     private var activeRecordingShouldPressReturn = false
     private var activeRecordingStartedByAirPods = false
+    private var airPodsSubmitEligible = false
     private var activeRecordingStartedByHeadsetHold = false
     private var activeRecordingSource = ""
     private var airPodsMuteStateObserver: NSObjectProtocol?
@@ -599,6 +600,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Self.appendHeadsetDebugLog("airpods submit ignored recording=\(recorder.hasActiveRecording) stage=\(state.transcriptionStage)")
             return
         }
+        guard airPodsSubmitEligible else {
+            Self.appendHeadsetDebugLog("airpods submit ignored reason=no-airpods-transcript")
+            state.statusText = "Dictate with AirPods first"
+            showMenuBarFeedback("No transcript")
+            return
+        }
+        airPodsSubmitEligible = false
         Self.appendHeadsetDebugLog("airpods submit press-return")
         pressReturnKey()
         state.statusText = "Submitted"
@@ -905,6 +913,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 state.lastTranscription = text
                 state.transcriptionStage = .done
                 state.statusText = "Done"
+                if wasStartedByAirPods {
+                    airPodsSubmitEligible = true
+                }
                 Self.appendTranscriptionDebugLog("done source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) textChars=\(text.count)")
 
                 let pasteboard = NSPasteboard.general
@@ -1637,6 +1648,19 @@ final class HeadsetProbeManager {
     private static let playPauseUsage: UInt32 = 0xcd
     private static let nextTrackUsage: UInt32 = 0xb5
     private static let longPressThreshold: TimeInterval = 0.45
+    private static let keyboardMediaKeySuppressWindow: TimeInterval = 0.35
+    private static let nxKeyTypePlay: Int = 16
+    private static let nxKeyTypeNext: Int = 17
+    private static let nxKeyTypePrevious: Int = 18
+    private static let nxKeyTypeFast: Int = 19
+    private static let nxKeyTypeRewind: Int = 20
+    private static let keyboardMediaKeyTypes: Set<Int> = [
+        nxKeyTypePlay,
+        nxKeyTypeNext,
+        nxKeyTypePrevious,
+        nxKeyTypeFast,
+        nxKeyTypeRewind
+    ]
 
     private let state: AppState
     private let onTogglePressed: () -> Void
@@ -1661,6 +1685,8 @@ final class HeadsetProbeManager {
     private var playPauseReleasePollTimer: Timer?
     private var lastInputReportPlayPauseValue: UInt8 = 0
     private var longPressActive = false
+    private var localMediaKeyMonitors: [Any] = []
+    private var lastKeyboardMediaKeyAt: Date?
 
     private static func appendHeadsetDebugLog(_ message: String) {
         DebugLog.append(message, to: "/tmp/wire-headset.log")
@@ -1891,6 +1917,7 @@ final class HeadsetProbeManager {
             startSilentAirPodsProbeAudio()
             publishAirPodsProbeNowPlaying()
         }
+        installLocalMediaKeySuppression()
         let center = MPRemoteCommandCenter.shared()
         let commands: [(String, MPRemoteCommand)] = [
             ("remote play", center.playCommand),
@@ -1923,6 +1950,7 @@ final class HeadsetProbeManager {
             target.command.isEnabled = false
         }
         remoteCommandTargets.removeAll()
+        removeLocalMediaKeySuppression()
         stopAirPodsNowPlayingTimer()
         stopSilentAirPodsProbeAudio()
         clearAirPodsProbeNowPlaying()
@@ -1931,7 +1959,47 @@ final class HeadsetProbeManager {
     private func logRemoteCommand(_ label: String, event: MPRemoteCommandEvent) {
         Self.appendAirPodsDebugLog("mp label=\(label) recording=\(isRecording())")
         refreshAirPodsRemoteTarget()
+        guard !shouldSuppressRemoteCommandAfterKeyboardMediaKey(label) else {
+            Self.appendAirPodsDebugLog("ignored label=\(label) reason=keyboard-media-key")
+            return
+        }
         handleAirPodsRemoteCommand(label)
+    }
+
+    private func installLocalMediaKeySuppression() {
+        guard localMediaKeyMonitors.isEmpty else { return }
+        let handler: (NSEvent) -> Void = { [weak self] event in
+            self?.recordKeyboardMediaKeyIfNeeded(event)
+        }
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: .systemDefined, handler: handler) {
+            localMediaKeyMonitors.append(monitor)
+        }
+        if let localMonitor = NSEvent.addLocalMonitorForEvents(matching: .systemDefined, handler: { [weak self] event in
+            self?.recordKeyboardMediaKeyIfNeeded(event)
+            return event
+        }) {
+            localMediaKeyMonitors.append(localMonitor)
+        }
+    }
+
+    private func removeLocalMediaKeySuppression() {
+        localMediaKeyMonitors.forEach(NSEvent.removeMonitor)
+        localMediaKeyMonitors.removeAll()
+        lastKeyboardMediaKeyAt = nil
+    }
+
+    private func recordKeyboardMediaKeyIfNeeded(_ event: NSEvent) {
+        guard event.subtype.rawValue == 8 else { return }
+        let keyCode = (event.data1 & 0xffff0000) >> 16
+        let keyState = (event.data1 & 0x0000ff00) >> 8
+        guard keyState == 0x0a, Self.keyboardMediaKeyTypes.contains(keyCode) else { return }
+        lastKeyboardMediaKeyAt = Date()
+        Self.appendAirPodsDebugLog("keyboard media key observed keyCode=\(keyCode)")
+    }
+
+    private func shouldSuppressRemoteCommandAfterKeyboardMediaKey(_ label: String) -> Bool {
+        guard label.hasPrefix("remote "), let lastKeyboardMediaKeyAt else { return false }
+        return Date().timeIntervalSince(lastKeyboardMediaKeyAt) <= Self.keyboardMediaKeySuppressWindow
     }
 
     private func handleAirPodsRemoteCommand(_ label: String) {
@@ -3498,20 +3566,20 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             return
         }
 
-        let label = NSTextField(labelWithString: "Left tap starts or continues dictation.\nRight tap submits with Return.\nRecording stops after a short silence.")
+        let label = NSTextField(labelWithString: "Left tap starts or continues dictation.\nRight tap sends Return once after an AirPods transcript.\nRecording stops after a short silence.\nThis mode takes over media controls, so it can interfere with music playback.")
         label.font = .systemFont(ofSize: 12)
         label.textColor = .labelColor
         label.lineBreakMode = .byWordWrapping
         label.maximumNumberOfLines = 0
-        label.preferredMaxLayoutWidth = 198
+        label.preferredMaxLayoutWidth = 236
         label.translatesAutoresizingMaskIntoConstraints = false
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 222, height: 88))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 132))
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(label)
         NSLayoutConstraint.activate([
-            container.widthAnchor.constraint(equalToConstant: 222),
-            container.heightAnchor.constraint(equalToConstant: 88),
+            container.widthAnchor.constraint(equalToConstant: 260),
+            container.heightAnchor.constraint(equalToConstant: 132),
             label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
             label.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
@@ -3520,11 +3588,11 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
 
         let controller = NSViewController()
         controller.view = container
-        controller.preferredContentSize = NSSize(width: 222, height: 88)
+        controller.preferredContentSize = NSSize(width: 260, height: 132)
 
         let popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 222, height: 88)
+        popover.contentSize = NSSize(width: 260, height: 132)
         popover.contentViewController = controller
         airPodsInfoPopover = popover
         popover.show(relativeTo: airPodsInfoButton.bounds, of: airPodsInfoButton, preferredEdge: .maxY)
