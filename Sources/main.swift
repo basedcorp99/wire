@@ -710,6 +710,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startRecording(
             status: "Recording… release headset button to transcribe",
             kind: .hold,
+            useBuiltInInput: true,
             sendReturnAfterPasteEligible: true,
             startedByHeadsetHold: true,
             source: "headset-hold"

@@ -45,7 +45,7 @@ and opens it. If `/Applications` requires admin rights, the script will ask via 
 - Toggle recordings do not have a fixed local time cap. While recording, the menu bar item shows `REC` with the elapsed duration so you can spot an accidentally active recording.
 - Click either shortcut button to reset it. While recording a new shortcut, the button shows `Listening…`, then updates live as you press modifiers/keys (for example `⌘⇧M`). It saves when all keys are released; press `Esc` to cancel.
 - **Headset controls** can be disabled with one switch. When disabled, wired headset controls, AirPods controls, and wired-only Return-after-paste are all inactive.
-- Wired headset button modes are **Long hold to dictate** and **Long press to toggle**.
+- Wired headset button modes are **Long hold to dictate** and **Long press to toggle**. Hold mode records from the built-in Mac microphone because some wired headset buttons silence the inline mic while held.
 - **AirPods controls (experimental)** maps the AirPods left-tap / next-track control to start or continue recording from the AirPods microphone when available. When no AirPods input is connected, `wire` leaves the silent Now Playing probe off so normal music controls are not taken over. Since AirPods media taps are not reliable while that microphone is active, `wire` auto-stops after a short silence. Right tap / play-pause submits with Return when not recording.
 - **Wired sends Return** sends Return only after transcripts started from the wired headset button.
 - The latest transcript appears in the popover, with a copy button beside it.
