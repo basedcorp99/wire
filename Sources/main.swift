@@ -592,7 +592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleAirPodsTogglePressed() {
-        handleTranscribe(useAirPodsInput: true, sendReturnAfterPasteEligible: true, startedByAirPods: true, source: "airpods-toggle")
+        handleTranscribe(useAirPodsInput: true, startedByAirPods: true, source: "airpods-toggle")
     }
 
     private func handleAirPodsSubmitPressed() {
@@ -1687,6 +1687,8 @@ final class HeadsetProbeManager {
     private var longPressActive = false
     private var localMediaKeyMonitors: [Any] = []
     private var lastKeyboardMediaKeyAt: Date?
+    private var airPodsAvailabilityTimer: Timer?
+    private var lastAirPodsAvailability: Bool?
 
     private static func appendHeadsetDebugLog(_ message: String) {
         DebugLog.append(message, to: "/tmp/wire-headset.log")
@@ -1774,6 +1776,7 @@ final class HeadsetProbeManager {
             UserDefaults.standard.set(enabled, forKey: Self.airPodsControlDefaultsKey)
         }
         airPodsControlEnabled = enabled
+        syncAirPodsAvailabilityTimer()
         syncRemoteCommandProbe()
         if persist {
             state.statusText = enabled ? "Experimental AirPods enabled" : "Experimental AirPods disabled"
@@ -1784,12 +1787,14 @@ final class HeadsetProbeManager {
         guard controlsEnabled else { return }
         Self.appendHeadsetDebugLog("controls start")
         installHIDControl()
+        syncAirPodsAvailabilityTimer()
         syncRemoteCommandProbe()
     }
 
     func stop() {
         cancelPendingLongPress()
         stopPlayPauseReleasePolling()
+        stopAirPodsAvailabilityTimer()
         removeRemoteCommandProbe()
         removeHIDControl()
     }
@@ -1904,7 +1909,7 @@ final class HeadsetProbeManager {
     }
 
     private func syncRemoteCommandProbe() {
-        if controlsEnabled && airPodsControlEnabled {
+        if controlsEnabled && airPodsControlEnabled && isAirPodsInputConnected() {
             installRemoteCommandProbe()
         } else {
             removeRemoteCommandProbe()
@@ -1913,6 +1918,10 @@ final class HeadsetProbeManager {
 
     private func installRemoteCommandProbe() {
         guard remoteCommandTargets.isEmpty else { return }
+        guard isAirPodsInputConnected() else {
+            publishAirPodsAvailabilityIfChanged(false)
+            return
+        }
         if airPodsControlEnabled {
             startSilentAirPodsProbeAudio()
             publishAirPodsProbeNowPlaying()
@@ -1942,6 +1951,41 @@ final class HeadsetProbeManager {
         }
         Self.appendHeadsetDebugLog("remote commands installed count=\(remoteCommandTargets.count)")
         startAirPodsNowPlayingTimer()
+    }
+
+    private func syncAirPodsAvailabilityTimer() {
+        if controlsEnabled && airPodsControlEnabled {
+            startAirPodsAvailabilityTimer()
+        } else {
+            stopAirPodsAvailabilityTimer()
+        }
+    }
+
+    private func startAirPodsAvailabilityTimer() {
+        guard airPodsAvailabilityTimer == nil else { return }
+        publishAirPodsAvailabilityIfChanged(isAirPodsInputConnected())
+        airPodsAvailabilityTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.publishAirPodsAvailabilityIfChanged(self.isAirPodsInputConnected())
+            self.syncRemoteCommandProbe()
+        }
+    }
+
+    private func stopAirPodsAvailabilityTimer() {
+        airPodsAvailabilityTimer?.invalidate()
+        airPodsAvailabilityTimer = nil
+        lastAirPodsAvailability = nil
+    }
+
+    private func publishAirPodsAvailabilityIfChanged(_ connected: Bool) {
+        guard lastAirPodsAvailability != connected else { return }
+        lastAirPodsAvailability = connected
+        let name = DefaultAudioInputOverride.airPodsInputDeviceID().flatMap { DefaultAudioInputOverride.audioDeviceName($0) } ?? "none"
+        Self.appendAirPodsDebugLog("availability connected=\(connected) input=\(name)")
+    }
+
+    private func isAirPodsInputConnected() -> Bool {
+        DefaultAudioInputOverride.airPodsInputDeviceID() != nil
     }
 
     private func removeRemoteCommandProbe() {
@@ -2053,12 +2097,18 @@ final class HeadsetProbeManager {
     }
 
     private func refreshAirPodsRemoteTarget() {
+        guard isAirPodsInputConnected() else {
+            publishAirPodsAvailabilityIfChanged(false)
+            removeRemoteCommandProbe()
+            return
+        }
         ensureSilentAirPodsProbeAudio()
         publishAirPodsProbeNowPlaying()
     }
 
     private func ensureSilentAirPodsProbeAudio() {
         guard airPodsControlEnabled else { return }
+        guard isAirPodsInputConnected() else { return }
         guard let engine = airPodsProbeEngine,
               let player = airPodsProbePlayer else {
             startSilentAirPodsProbeAudio()
@@ -2076,6 +2126,10 @@ final class HeadsetProbeManager {
 
     private func startSilentAirPodsProbeAudio() {
         guard airPodsProbeEngine == nil, airPodsProbePlayer == nil else { return }
+        guard isAirPodsInputConnected() else {
+            publishAirPodsAvailabilityIfChanged(false)
+            return
+        }
         guard let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1),
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 44_100) else {
             return
