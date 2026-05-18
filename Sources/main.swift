@@ -1061,7 +1061,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let stats = wavStats(data) else {
             return data.count > 18_000
         }
-        return stats.duration > 0.1
+        return stats.duration > 0.1 && (stats.rms >= 8 || stats.peak >= 80)
     }
 
     private func wavStats(_ data: Data) -> (duration: Double, rms: Double, peak: Int)? {
@@ -1525,10 +1525,13 @@ final class DefaultAudioInputOverride {
 
     private static func isBuiltInInput(_ deviceID: AudioDeviceID) -> Bool {
         let name = (audioDeviceName(deviceID) ?? "").lowercased()
-        if name.contains("macbook") || name.contains("built-in") || name.contains("built in") {
+        if name.contains("macbook")
+            || name.contains("built-in microphone")
+            || name.contains("built in microphone")
+            || name.contains("internal microphone") {
             return true
         }
-        return audioTransport(deviceID) == kAudioDeviceTransportTypeBuiltIn
+        return false
     }
 
     private static func isAirPodsInput(_ deviceID: AudioDeviceID) -> Bool {
