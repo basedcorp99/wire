@@ -94,6 +94,40 @@ enum DebugLog {
     }
 }
 
+// MARK: - Clipboard
+
+enum Clipboard {
+    @discardableResult
+    static func copy(_ text: String) -> Bool {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        if pasteboard.setString(text, forType: .string) {
+            return true
+        }
+        return copyWithPbcopy(text)
+    }
+
+    private static func copyWithPbcopy(_ text: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pbcopy")
+
+        let input = Pipe()
+        process.standardInput = input
+
+        do {
+            try process.run()
+            if let data = text.data(using: .utf8) {
+                input.fileHandleForWriting.write(data)
+            }
+            try? input.fileHandleForWriting.close()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+}
+
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -917,11 +951,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if wasStartedByAirPods {
                     airPodsSubmitEligible = true
                 }
-                Self.appendTranscriptionDebugLog("done source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) textChars=\(text.count)")
-
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-                pasteboard.setString(text, forType: .string)
+                let copiedToClipboard = Clipboard.copy(text)
+                Self.appendTranscriptionDebugLog("done source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) textChars=\(text.count) clipboard=\(copiedToClipboard)")
 
                 if !handleComputerTranscript(text) {
                     typeText(text, pressReturnAfterPaste: shouldPressReturnAfterPaste)
@@ -1126,9 +1157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        Clipboard.copy(text)
 
         // Paste using Cmd+V
         let source = CGEventSource(stateID: .hidSystemState)
@@ -3596,10 +3625,11 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
 
     @objc private func copyLatest() {
         guard !state.lastTranscription.isEmpty else { return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(state.lastTranscription, forType: .string)
-        state.statusText = "Copied latest transcription"
+        if Clipboard.copy(state.lastTranscription) {
+            state.statusText = "Copied latest transcription"
+        } else {
+            state.statusText = "Could not copy latest transcription"
+        }
     }
 
     @objc private func toggleHeadsetControls() {
