@@ -143,6 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let airPodsAutoStopSilenceSeconds: TimeInterval = 1.4
     private static let airPodsAutoStopMinimumSeconds: TimeInterval = 1.2
     private static let airPodsMinimumVoiceRMS: Float = 140
+    private static let recoverableRecordingURL = URL(fileURLWithPath: "/tmp/wire-recoverable-recording.wav")
 
     private let state = AppState()
     private var statusItem: NSStatusItem!
@@ -832,7 +833,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
-            state.lastTranscription = ""
             state.transcriptionStage = .recording
             state.statusText = status
             state.isBusy = true
@@ -940,12 +940,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
+            try? data.write(to: Self.recoverableRecordingURL)
+            state.hasRecoverableRecording = true
             state.statusText = "Loading… uploading \(data.count / 1024) KB"
 
             do {
                 let text = try await transcribe(data, retryASRFailure: wasStartedByAirPods)
 
                 state.lastTranscription = text
+                try? FileManager.default.removeItem(at: Self.recoverableRecordingURL)
+                state.hasRecoverableRecording = false
                 state.transcriptionStage = .done
                 state.statusText = "Done"
                 if wasStartedByAirPods {
@@ -977,23 +981,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return selfTestTranscript
         }
 
-        do {
-            return try await codexClient.transcribe(audioData: data)
-        } catch {
-            guard retryASRFailure, isASRBackendFailure(error) else {
-                throw error
+        var attempt = 0
+        while true {
+            do {
+                return try await codexClient.transcribe(audioData: data)
+            } catch {
+                if let delay = retryDelayForTemporaryTranscriptionFailure(error), attempt < 3 {
+                    attempt += 1
+                    let boundedDelay = min(max(delay, 5), 90)
+                    await MainActor.run {
+                        state.statusText = "Transcription busy, retrying in \(Int(boundedDelay))s..."
+                    }
+                    Self.appendTranscriptionDebugLog("retry reason=temporary-unavailable attempt=\(attempt) delay=\(Int(boundedDelay))")
+                    try await Task.sleep(nanoseconds: UInt64(boundedDelay * 1_000_000_000))
+                    continue
+                }
+
+                guard retryASRFailure, isASRBackendFailure(error) else {
+                    throw error
+                }
+                await MainActor.run {
+                    state.statusText = "Speech recognition failed, retrying..."
+                }
+                try await Task.sleep(nanoseconds: 800_000_000)
+                return try await codexClient.transcribe(audioData: data)
             }
-            await MainActor.run {
-                state.statusText = "Speech recognition failed, retrying..."
-            }
-            try await Task.sleep(nanoseconds: 800_000_000)
-            return try await codexClient.transcribe(audioData: data)
         }
+    }
+
+    private func retryDelayForTemporaryTranscriptionFailure(_ error: Error) -> TimeInterval? {
+        guard case AppError.transcriptionFailed(let message) = error else { return nil }
+        guard message.contains("HTTP 429")
+                || message.localizedCaseInsensitiveContains("temporarily unavailable") else {
+            return nil
+        }
+
+        let marker = "\"retry_after_seconds\":"
+        if let markerRange = message.range(of: marker) {
+            let suffix = message[markerRange.upperBound...]
+            let digits = suffix.prefix { $0.isNumber }
+            if let seconds = TimeInterval(String(digits)) {
+                return seconds
+            }
+        }
+        return 30
     }
 
     private func isASRBackendFailure(_ error: Error) -> Bool {
         guard case AppError.transcriptionFailed(let message) = error else { return false }
         return message.contains("HTTP 500") && message.localizedCaseInsensitiveContains("ASR")
+    }
+
+    @objc func retryLastRecordingObjc() {
+        retryLastRecording()
+    }
+
+    private func retryLastRecording() {
+        Task { @MainActor in
+            guard !state.isBusy, !recorder.hasActiveRecording, state.transcriptionStage != .transcribing else { return }
+            guard let data = try? Data(contentsOf: Self.recoverableRecordingURL), data.count > 1000 else {
+                state.statusText = "No saved recording to retry"
+                state.hasRecoverableRecording = false
+                return
+            }
+
+            state.isBusy = true
+            state.hasRecoverableRecording = true
+            state.transcriptionStage = .transcribing
+            state.statusText = "Retrying saved recording..."
+            do {
+                let text = try await transcribe(data, retryASRFailure: false)
+                state.lastTranscription = text
+                try? FileManager.default.removeItem(at: Self.recoverableRecordingURL)
+                state.hasRecoverableRecording = false
+                state.transcriptionStage = .done
+                state.statusText = "Recovered saved recording"
+                _ = Clipboard.copy(text)
+                Self.appendTranscriptionDebugLog("retry-last done bytes=\(data.count) textChars=\(text.count)")
+                if !handleComputerTranscript(text) {
+                    typeText(text, pressReturnAfterPaste: false)
+                }
+            } catch {
+                state.statusText = "Retry failed: \(error.localizedDescription)"
+                state.transcriptionStage = .error(error.localizedDescription)
+                Self.appendTranscriptionDebugLog("retry-last error bytes=\(data.count) error=\(error.localizedDescription)")
+            }
+            state.isBusy = false
+        }
     }
 
     @discardableResult
@@ -1429,6 +1503,7 @@ final class AppState {
     var isBusy = false { didSet { onChange?() } }
     var statusText = "" { didSet { onChange?() } }
     var lastTranscription = "" { didSet { onChange?() } }
+    var hasRecoverableRecording = FileManager.default.fileExists(atPath: "/tmp/wire-recoverable-recording.wav") { didSet { onChange?() } }
     var transcriptionStage: TranscriptionStage = .idle { didSet { onChange?() } }
     var sendEnterAfterPaste = false { didSet { onChange?() } }
     var headsetControlsEnabled = true { didSet { onChange?() } }
@@ -3087,6 +3162,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private let computerHarnessField = NSTextField(string: "")
     private let transcriptLabel = NSTextField(labelWithString: "No recent transcription")
     private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
+    private let retryLastButton = NSButton(title: "", target: nil, action: nil)
     private let loadingIndicator = NSProgressIndicator()
     private var headsetSettingsRows: [NSView] = []
     private var computerModeRows: [NSView] = []
@@ -3227,11 +3303,25 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         copyLatestButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
         copyLatestButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
+        retryLastButton.target = self
+        retryLastButton.action = #selector(retryLastRecording)
+        retryLastButton.bezelStyle = .inline
+        retryLastButton.isBordered = false
+        retryLastButton.imagePosition = .imageOnly
+        retryLastButton.toolTip = "Retry saved recording"
+        if let retryImage = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Retry saved recording") {
+            retryImage.isTemplate = true
+            retryLastButton.image = retryImage
+        }
+        retryLastButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        retryLastButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+
         let latestRow = NSStackView()
         latestRow.orientation = .horizontal
         latestRow.alignment = .centerY
         latestRow.spacing = 8
         latestRow.addArrangedSubview(transcriptLabel)
+        latestRow.addArrangedSubview(retryLastButton)
         latestRow.addArrangedSubview(copyLatestButton)
         rootStack.addArrangedSubview(padded(latestRow, left: 14, right: 14, top: 3, bottom: 8))
 
@@ -3580,6 +3670,8 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
                 self.transcriptLabel.stringValue = self.state.lastTranscription.isEmpty ? "No recent transcription" : self.state.lastTranscription
             }
             self.copyLatestButton.isEnabled = !self.transcriptLabel.stringValue.isEmpty && self.transcriptLabel.stringValue != "No recent transcription"
+            self.retryLastButton.isHidden = !self.state.hasRecoverableRecording
+            self.retryLastButton.isEnabled = self.state.hasRecoverableRecording && !self.state.isBusy
             self.updatePreferredContentSize()
         }
         if Thread.isMainThread {
@@ -3590,7 +3682,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     }
 
     private func updatePreferredContentSize() {
-        let latestTextWidth = Layout.width - 14 - 14 - 8 - 24
+        let latestTextWidth = Layout.width - 14 - 14 - 8 - 24 - 8 - 24
         transcriptLabel.preferredMaxLayoutWidth = latestTextWidth
         view.layoutSubtreeIfNeeded()
         rootStack.layoutSubtreeIfNeeded()
@@ -3630,6 +3722,10 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         } else {
             state.statusText = "Could not copy latest transcription"
         }
+    }
+
+    @objc private func retryLastRecording() {
+        (NSApp.delegate as? AppDelegate)?.retryLastRecordingObjc()
     }
 
     @objc private func toggleHeadsetControls() {
