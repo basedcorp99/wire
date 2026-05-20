@@ -2798,18 +2798,46 @@ final class AudioRecorder: NSObject {
 // MARK: - Codex API Client (WKWebView-backed)
 
 final class CodexAPIClient: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+    private static let sessionURLString = "https://chatgpt.com"
+    private static let maximumPrepareAttempts = 6
+    private static let prepareRetryDelays: [UInt64] = [
+        1_000_000_000,
+        2_000_000_000,
+        4_000_000_000,
+        8_000_000_000,
+        15_000_000_000
+    ]
+
     private var webView: WKWebView?
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var isReady = false
+    private var prepareTask: Task<Void, Error>?
 
     private var authToken: String = ""
     private var accountID: String = ""
     private var transcriptionContinuation: CheckedContinuation<String, Error>?
 
-    /// Read token from ~/.codex/auth.json and prepare the WKWebView session
+    /// Read token from ~/.codex/auth.json and prepare the WKWebView session.
     func prepare() async throws {
-        try readAuthToken()
-        try await setupWebView()
+        if isReady, webView != nil {
+            return
+        }
+        if let prepareTask {
+            try await prepareTask.value
+            return
+        }
+
+        let task = Task { @MainActor in
+            try await prepareWithRetries()
+        }
+        prepareTask = task
+        do {
+            try await task.value
+            prepareTask = nil
+        } catch {
+            prepareTask = nil
+            throw error
+        }
     }
 
     private func readAuthToken() throws {
@@ -2833,8 +2861,29 @@ final class CodexAPIClient: NSObject, WKNavigationDelegate, WKScriptMessageHandl
         self.accountID = account
     }
 
+    private func prepareWithRetries() async throws {
+        try readAuthToken()
+
+        var lastError: Error = AppError.sessionNotReady
+        for attempt in 0..<Self.maximumPrepareAttempts {
+            do {
+                try await setupWebView()
+                return
+            } catch {
+                lastError = error
+                cleanupWebView()
+                if attempt < Self.prepareRetryDelays.count {
+                    try await Task.sleep(nanoseconds: Self.prepareRetryDelays[attempt])
+                }
+            }
+        }
+        throw lastError
+    }
+
     private func setupWebView() async throws {
-        return try await withCheckedThrowingContinuation { continuation in
+        isReady = false
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.readyContinuation = continuation
 
             let config = WKWebViewConfiguration()
@@ -2846,46 +2895,56 @@ final class CodexAPIClient: NSObject, WKNavigationDelegate, WKScriptMessageHandl
             webView.customUserAgent = "Codex Desktop/26.513.20950 (Macintosh; Intel Mac OS X)"
             self.webView = webView
 
-            // Load chatgpt.com to establish Cloudflare session
-            let request = URLRequest(url: URL(string: "https://chatgpt.com")!)
+            // Load chatgpt.com to establish Cloudflare/session cookies before the API call.
+            let request = URLRequest(url: URL(string: Self.sessionURLString)!)
             webView.load(request)
 
-            // Timeout: if navigation takes >15s, proceed anyway
-            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
-                guard let self, !self.isReady else { return }
-                self.isReady = true
-                self.readyContinuation?.resume()
-                self.readyContinuation = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self, weak webView] in
+                guard let self, !self.isReady, self.webView === webView else { return }
+                self.finishPreparing(.failure(AppError.transcriptionFailed("Timed out loading ChatGPT session")))
             }
         }
+    }
+
+    private func finishPreparing(_ result: Result<Void, Error>) {
+        guard let continuation = readyContinuation else { return }
+        readyContinuation = nil
+        switch result {
+        case .success:
+            isReady = true
+            continuation.resume()
+        case .failure(let error):
+            isReady = false
+            continuation.resume(throwing: error)
+        }
+    }
+
+    private func cleanupWebView() {
+        webView?.stopLoading()
+        webView?.navigationDelegate = nil
+        webView = nil
+        isReady = false
+        readyContinuation = nil
     }
 
     // MARK: - WKNavigationDelegate
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard let url = webView.url?.absoluteString else { return }
-        if url.contains("chatgpt.com") {
-            isReady = true
-            readyContinuation?.resume()
-            readyContinuation = nil
+        guard self.webView === webView,
+              webView.url?.host?.hasSuffix("chatgpt.com") == true else {
+            return
         }
+        finishPreparing(.success(()))
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        // Might still work if it partially loaded (Cloudflare handled)
-        if !isReady {
-            isReady = true
-            readyContinuation?.resume()
-            readyContinuation = nil
-        }
+        guard self.webView === webView else { return }
+        finishPreparing(.failure(error))
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        if !isReady {
-            isReady = true
-            readyContinuation?.resume()
-            readyContinuation = nil
-        }
+        guard self.webView === webView else { return }
+        finishPreparing(.failure(error))
     }
 
     private func makeMultipartBody(audioData: Data, boundary: String) -> Data {
@@ -2936,7 +2995,23 @@ final class CodexAPIClient: NSObject, WKNavigationDelegate, WKScriptMessageHandl
     // MARK: - Transcribe
 
     func transcribe(audioData: Data) async throws -> String {
-        guard isReady, let webView = webView else {
+        do {
+            return try await transcribePrepared(audioData: audioData)
+        } catch {
+            guard isWebViewSessionFailure(error) else {
+                throw error
+            }
+            cleanupWebView()
+            try await prepare()
+            return try await transcribePrepared(audioData: audioData)
+        }
+    }
+
+    private func transcribePrepared(audioData: Data) async throws -> String {
+        if !isReady || webView == nil {
+            try await prepare()
+        }
+        guard let webView = webView else {
             throw AppError.sessionNotReady
         }
 
@@ -3031,16 +3106,28 @@ final class CodexAPIClient: NSObject, WKNavigationDelegate, WKScriptMessageHandl
                         finish(.failure(AppError.transcriptionFailed(errorMsg)))
                     }
                 case .failure(let error):
+                    self.cleanupWebView()
                     finish(.failure(AppError.transcriptionFailed(error.localizedDescription)))
                 }
             }
         }
     }
 
+    private func isWebViewSessionFailure(_ error: Error) -> Bool {
+        guard case AppError.transcriptionFailed(let message) = error else {
+            return false
+        }
+        return message == "Load failed"
+            || message.localizedCaseInsensitiveContains("webview")
+            || message.localizedCaseInsensitiveContains("could not connect to the server")
+            || message.localizedCaseInsensitiveContains("the internet connection appears to be offline")
+            || message.localizedCaseInsensitiveContains("network connection was lost")
+    }
+
     func cleanup() {
-        webView?.stopLoading()
-        webView = nil
-        isReady = false
+        cleanupWebView()
+        prepareTask?.cancel()
+        prepareTask = nil
     }
 }
 
