@@ -144,6 +144,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let airPodsAutoStopMinimumSeconds: TimeInterval = 1.2
     private static let airPodsMinimumVoiceRMS: Float = 140
     private static let recoverableRecordingURL = URL(fileURLWithPath: "/tmp/wire-recoverable-recording.wav")
+    private static let recoverableRecordingDirectoryURL = URL(fileURLWithPath: "/tmp/wire-recoverable-recordings", isDirectory: true)
+
+    private struct QueuedTranscriptionJob {
+        let id: Int
+        let audioData: Data
+        let recoveryURL: URL?
+        let shouldPressReturnAfterPaste: Bool
+        let retryASRFailure: Bool
+        let wasStartedByAirPods: Bool
+        let kind: HotKeyKind?
+        let source: String
+    }
 
     private let state = AppState()
     private var statusItem: NSStatusItem!
@@ -173,9 +185,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var activeRecordingKind: HotKeyKind?
     private var holdRecordingStartPending = false
     private var stopHoldWhenRecordingStarts = false
+    private var queuedTranscriptionJobs: [QueuedTranscriptionJob] = []
+    private var activeTranscriptionJob: QueuedTranscriptionJob?
+    private var isProcessingTranscriptionQueue = false
+    private var nextTranscriptionJobID = 1
     private var selfTestTranscript: String?
     private var selfTestTranscribeByteCounts: [Int] = []
     private let statusSpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    private var pendingTranscriptionCount: Int {
+        queuedTranscriptionJobs.count + (activeTranscriptionJob == nil ? 0 : 1)
+    }
+
+    private var hasPendingTranscriptions: Bool {
+        pendingTranscriptionCount > 0 || isProcessingTranscriptionQueue
+    }
 
     private static func appendTranscriptionDebugLog(_ message: String) {
         DebugLog.append(message, to: "/tmp/wire-transcribe.log")
@@ -247,6 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.renderStatusItem()
             controller?.refresh()
         }
+        refreshRecoverableRecordingState()
         hotKeyManager.registerSavedShortcuts()
         headsetProbeManager.restoreSavedState()
         headsetProbeManager.setControlsEnabled(state.headsetControlsEnabled)
@@ -818,17 +843,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 clearPendingHoldStartIfNeeded(kind: kind)
                 return
             }
-            guard state.transcriptionStage != .transcribing else {
-                Self.appendTranscriptionDebugLog("start ignored source=\(source) kind=\(kind) reason=already-transcribing")
-                clearPendingHoldStartIfNeeded(kind: kind)
-                return
-            }
 
             guard await ensureMicrophonePermission() else {
                 clearPendingHoldStartIfNeeded(kind: kind)
                 state.statusText = "Enable Microphone permission for wire"
-                state.transcriptionStage = .error("Microphone permission missing")
-                state.isBusy = false
+                if hasPendingTranscriptions {
+                    state.isBusy = true
+                } else {
+                    state.transcriptionStage = .error("Microphone permission missing")
+                    state.isBusy = false
+                }
                 openMicrophoneSettings()
                 return
             }
@@ -869,8 +893,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 clearPendingHoldStartIfNeeded(kind: kind)
                 state.statusText = "Could not start recording: \(error.localizedDescription)"
                 Self.appendTranscriptionDebugLog("start failed source=\(source) kind=\(kind) error=\(error.localizedDescription)")
-                state.transcriptionStage = .error(error.localizedDescription)
-                state.isBusy = false
+                if hasPendingTranscriptions {
+                    state.isBusy = true
+                } else {
+                    state.transcriptionStage = .error(error.localizedDescription)
+                    state.isBusy = false
+                }
             }
         }
     }
@@ -887,8 +915,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Self.appendTranscriptionDebugLog("stop ignored reason=no-active-recording kind=\(String(describing: activeRecordingKind))")
                 return
             }
-            state.statusText = "Loading… transcribing"
-            state.transcriptionStage = .transcribing
 
             let audioData = recorder.stop()
             let shouldPressReturnAfterPaste = activeRecordingShouldPressReturn && state.sendEnterAfterPaste
@@ -909,9 +935,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             guard let data = audioData, data.count > 1000 else {
                 Self.appendTranscriptionDebugLog("skip source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) reason=too-short bytes=\(audioData?.count ?? 0)")
-                state.statusText = "Recording too short, try again"
-                state.transcriptionStage = .error("Recording too short")
-                state.isBusy = false
+                finishStoppedRecordingWithoutTranscription(
+                    status: "Recording too short, try again",
+                    stage: .error("Recording too short")
+                )
                 return
             }
 
@@ -925,44 +952,141 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             guard hasCapturedAudio(data) else {
                 Self.appendTranscriptionDebugLog("skip source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) reason=no-captured-audio bytes=\(data.count)")
-                state.statusText = "No microphone audio captured"
-                state.transcriptionStage = .error("No microphone audio captured")
-                state.isBusy = false
+                finishStoppedRecordingWithoutTranscription(
+                    status: "No microphone audio captured",
+                    stage: .error("No microphone audio captured")
+                )
                 return
             }
 
             let shouldAlwaysAttemptTranscription = wasStartedByAirPods || wasStartedByHeadsetHold || stoppedRecordingKind == .hold
             guard shouldAlwaysAttemptTranscription || isLikelySpeechRecording(data) else {
                 Self.appendTranscriptionDebugLog("skip source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) reason=speech-gate bytes=\(data.count)")
-                state.statusText = "Ready"
-                state.transcriptionStage = .idle
-                state.isBusy = false
+                finishStoppedRecordingWithoutTranscription(status: "Ready", stage: .idle)
                 return
             }
 
-            try? data.write(to: Self.recoverableRecordingURL)
-            state.hasRecoverableRecording = true
-            state.statusText = "Loading… uploading \(data.count / 1024) KB"
+            enqueueTranscriptionJob(
+                audioData: data,
+                shouldPressReturnAfterPaste: shouldPressReturnAfterPaste,
+                retryASRFailure: wasStartedByAirPods,
+                wasStartedByAirPods: wasStartedByAirPods,
+                kind: stoppedRecordingKind,
+                source: stoppedRecordingSource
+            )
+        }
+    }
 
-            do {
-                let text = try await transcribe(data, retryASRFailure: wasStartedByAirPods)
+    private func finishStoppedRecordingWithoutTranscription(status: String, stage: TranscriptionStage) {
+        if hasPendingTranscriptions {
+            refreshTranscriptionQueueStatus()
+            return
+        }
 
-                state.lastTranscription = text
-                try? FileManager.default.removeItem(at: Self.recoverableRecordingURL)
-                state.hasRecoverableRecording = false
+        state.statusText = status
+        state.transcriptionStage = stage
+        state.isBusy = recorder.hasActiveRecording
+    }
+
+    private func enqueueTranscriptionJob(
+        audioData: Data,
+        shouldPressReturnAfterPaste: Bool,
+        retryASRFailure: Bool,
+        wasStartedByAirPods: Bool,
+        kind: HotKeyKind?,
+        source: String,
+        recoveryURL existingRecoveryURL: URL? = nil
+    ) {
+        let id = nextTranscriptionJobID
+        nextTranscriptionJobID += 1
+        let recoveryURL = existingRecoveryURL ?? writeRecoverableRecording(audioData, jobID: id)
+        let job = QueuedTranscriptionJob(
+            id: id,
+            audioData: audioData,
+            recoveryURL: recoveryURL,
+            shouldPressReturnAfterPaste: shouldPressReturnAfterPaste,
+            retryASRFailure: retryASRFailure,
+            wasStartedByAirPods: wasStartedByAirPods,
+            kind: kind,
+            source: source
+        )
+
+        queuedTranscriptionJobs.append(job)
+        refreshRecoverableRecordingState()
+        state.isBusy = true
+        if !recorder.hasActiveRecording {
+            state.transcriptionStage = .transcribing
+            state.statusText = queuedTranscriptionJobs.count == 1 && activeTranscriptionJob == nil
+                ? "Loading… uploading \(audioData.count / 1024) KB"
+                : transcriptionQueueStatusText()
+        }
+        Self.appendTranscriptionDebugLog("enqueue id=\(id) source=\(source) kind=\(String(describing: kind)) bytes=\(audioData.count) pending=\(pendingTranscriptionCount)")
+        startTranscriptionQueueWorkerIfNeeded()
+    }
+
+    private func startTranscriptionQueueWorkerIfNeeded() {
+        guard !isProcessingTranscriptionQueue else { return }
+        isProcessingTranscriptionQueue = true
+        Task { @MainActor in
+            await processTranscriptionQueue()
+        }
+    }
+
+    private func processTranscriptionQueue() async {
+        while !queuedTranscriptionJobs.isEmpty {
+            let job = queuedTranscriptionJobs.removeFirst()
+            activeTranscriptionJob = job
+            await processTranscriptionJob(job)
+            activeTranscriptionJob = nil
+        }
+
+        isProcessingTranscriptionQueue = false
+        refreshRecoverableRecordingState()
+        if recorder.hasActiveRecording {
+            state.transcriptionStage = .recording
+            state.isBusy = true
+        } else {
+            state.isBusy = false
+            if state.transcriptionStage == .transcribing {
+                state.transcriptionStage = state.lastTranscription.isEmpty ? .idle : .done
+                state.statusText = state.lastTranscription.isEmpty ? "Ready" : "Done"
+            }
+        }
+    }
+
+    private func processTranscriptionJob(_ job: QueuedTranscriptionJob) async {
+        if !recorder.hasActiveRecording {
+            state.transcriptionStage = .transcribing
+            state.statusText = "Loading… uploading \(job.audioData.count / 1024) KB"
+        }
+
+        do {
+            let text = try await transcribe(job.audioData, retryASRFailure: job.retryASRFailure)
+
+            state.lastTranscription = text
+            if let recoveryURL = job.recoveryURL {
+                try? FileManager.default.removeItem(at: recoveryURL)
+            }
+            refreshRecoverableRecordingState()
+            if !recorder.hasActiveRecording {
                 state.transcriptionStage = .done
-                state.statusText = "Done"
-                if wasStartedByAirPods {
-                    airPodsSubmitEligible = true
-                }
-                let copiedToClipboard = Clipboard.copy(text)
-                Self.appendTranscriptionDebugLog("done source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) textChars=\(text.count) clipboard=\(copiedToClipboard)")
+                state.statusText = queuedTranscriptionJobs.isEmpty ? "Done" : transcriptionQueueStatusText()
+            }
+            if job.wasStartedByAirPods {
+                airPodsSubmitEligible = true
+            }
+            let copiedToClipboard = Clipboard.copy(text)
+            Self.appendTranscriptionDebugLog("done id=\(job.id) source=\(job.source) kind=\(String(describing: job.kind)) textChars=\(text.count) clipboard=\(copiedToClipboard) remaining=\(queuedTranscriptionJobs.count)")
 
-                if !handleComputerTranscript(text) {
-                    typeText(text, pressReturnAfterPaste: shouldPressReturnAfterPaste)
-                }
-            } catch {
-                Self.appendTranscriptionDebugLog("error source=\(stoppedRecordingSource) kind=\(String(describing: stoppedRecordingKind)) error=\(error.localizedDescription)")
+            if !handleComputerTranscript(text) {
+                typeText(text, pressReturnAfterPaste: job.shouldPressReturnAfterPaste)
+            }
+
+            let pasteDelay: UInt64 = job.shouldPressReturnAfterPaste ? 260_000_000 : 120_000_000
+            try? await Task.sleep(nanoseconds: pasteDelay)
+        } catch {
+            Self.appendTranscriptionDebugLog("error id=\(job.id) source=\(job.source) kind=\(String(describing: job.kind)) error=\(error.localizedDescription)")
+            if !recorder.hasActiveRecording {
                 if isASRBackendFailure(error) {
                     state.statusText = "Error: speech recognition failed. Try again."
                     state.transcriptionStage = .error("Speech recognition failed")
@@ -971,8 +1095,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     state.transcriptionStage = .error(error.localizedDescription)
                 }
             }
-            state.isBusy = false
+            refreshRecoverableRecordingState()
         }
+
+        if !recorder.hasActiveRecording, !queuedTranscriptionJobs.isEmpty {
+            refreshTranscriptionQueueStatus()
+        }
+    }
+
+    private func refreshTranscriptionQueueStatus() {
+        state.isBusy = recorder.hasActiveRecording || hasPendingTranscriptions
+        guard !recorder.hasActiveRecording, hasPendingTranscriptions else { return }
+        state.transcriptionStage = .transcribing
+        state.statusText = transcriptionQueueStatusText()
+    }
+
+    private func transcriptionQueueStatusText() -> String {
+        let count = pendingTranscriptionCount
+        if count <= 1 {
+            return "Loading… transcribing"
+        }
+        return "Loading… transcribing (\(count) pending)"
+    }
+
+    private func writeRecoverableRecording(_ data: Data, jobID: Int) -> URL? {
+        do {
+            try FileManager.default.createDirectory(
+                at: Self.recoverableRecordingDirectoryURL,
+                withIntermediateDirectories: true
+            )
+            let filename = String(format: "wire-%06d-%@.wav", jobID, UUID().uuidString)
+            let url = Self.recoverableRecordingDirectoryURL.appendingPathComponent(filename)
+            try data.write(to: url)
+            return url
+        } catch {
+            Self.appendTranscriptionDebugLog("recoverable write failed id=\(jobID) error=\(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func refreshRecoverableRecordingState() {
+        state.hasRecoverableRecording = oldestRecoverableRecordingURL() != nil
+    }
+
+    private func oldestRecoverableRecordingURL() -> URL? {
+        var candidates: [URL] = []
+        if FileManager.default.fileExists(atPath: Self.recoverableRecordingURL.path) {
+            candidates.append(Self.recoverableRecordingURL)
+        }
+        if let urls = try? FileManager.default.contentsOfDirectory(
+            at: Self.recoverableRecordingDirectoryURL,
+            includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            candidates.append(contentsOf: urls.filter { $0.pathExtension.lowercased() == "wav" })
+        }
+
+        return candidates.sorted { lhs, rhs in
+            recoverableRecordingDate(lhs) < recoverableRecordingDate(rhs)
+        }.first
+    }
+
+    private func recoverableRecordingDate(_ url: URL) -> Date {
+        let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+        return values?.creationDate
+            ?? values?.contentModificationDate
+            ?? .distantPast
     }
 
     private func transcribe(_ data: Data, retryASRFailure: Bool) async throws -> String {
@@ -1038,35 +1226,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func retryLastRecording() {
         Task { @MainActor in
-            guard !state.isBusy, !recorder.hasActiveRecording, state.transcriptionStage != .transcribing else { return }
-            guard let data = try? Data(contentsOf: Self.recoverableRecordingURL), data.count > 1000 else {
+            guard !recorder.hasActiveRecording, !hasPendingTranscriptions else { return }
+            guard let recoveryURL = oldestRecoverableRecordingURL(),
+                  let data = try? Data(contentsOf: recoveryURL),
+                  data.count > 1000 else {
                 state.statusText = "No saved recording to retry"
-                state.hasRecoverableRecording = false
+                refreshRecoverableRecordingState()
                 return
             }
 
-            state.isBusy = true
-            state.hasRecoverableRecording = true
             state.transcriptionStage = .transcribing
             state.statusText = "Retrying saved recording..."
-            do {
-                let text = try await transcribe(data, retryASRFailure: false)
-                state.lastTranscription = text
-                try? FileManager.default.removeItem(at: Self.recoverableRecordingURL)
-                state.hasRecoverableRecording = false
-                state.transcriptionStage = .done
-                state.statusText = "Recovered saved recording"
-                _ = Clipboard.copy(text)
-                Self.appendTranscriptionDebugLog("retry-last done bytes=\(data.count) textChars=\(text.count)")
-                if !handleComputerTranscript(text) {
-                    typeText(text, pressReturnAfterPaste: false)
-                }
-            } catch {
-                state.statusText = "Retry failed: \(error.localizedDescription)"
-                state.transcriptionStage = .error(error.localizedDescription)
-                Self.appendTranscriptionDebugLog("retry-last error bytes=\(data.count) error=\(error.localizedDescription)")
-            }
-            state.isBusy = false
+            Self.appendTranscriptionDebugLog("retry-last enqueue url=\(recoveryURL.path) bytes=\(data.count)")
+            enqueueTranscriptionJob(
+                audioData: data,
+                shouldPressReturnAfterPaste: false,
+                retryASRFailure: false,
+                wasStartedByAirPods: false,
+                kind: nil,
+                source: "retry-last",
+                recoveryURL: recoveryURL
+            )
         }
     }
 
@@ -1503,7 +1683,7 @@ final class AppState {
     var isBusy = false { didSet { onChange?() } }
     var statusText = "" { didSet { onChange?() } }
     var lastTranscription = "" { didSet { onChange?() } }
-    var hasRecoverableRecording = FileManager.default.fileExists(atPath: "/tmp/wire-recoverable-recording.wav") { didSet { onChange?() } }
+    var hasRecoverableRecording = AppState.recoverableRecordingExistsOnDisk() { didSet { onChange?() } }
     var transcriptionStage: TranscriptionStage = .idle { didSet { onChange?() } }
     var sendEnterAfterPaste = false { didSet { onChange?() } }
     var headsetControlsEnabled = true { didSet { onChange?() } }
@@ -1514,6 +1694,21 @@ final class AppState {
     var computerCustomHarnessEnabled = false { didSet { onChange?() } }
     var computerHarnessCommand = "" { didSet { onChange?() } }
     var computerCommandRunning = false { didSet { onChange?() } }
+
+    private static func recoverableRecordingExistsOnDisk() -> Bool {
+        if FileManager.default.fileExists(atPath: "/tmp/wire-recoverable-recording.wav") {
+            return true
+        }
+        let directory = URL(fileURLWithPath: "/tmp/wire-recoverable-recordings", isDirectory: true)
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+        return urls.contains { $0.pathExtension.lowercased() == "wav" }
+    }
 }
 
 // MARK: - Headset Controls
