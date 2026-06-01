@@ -208,7 +208,8 @@ private enum BackgroundPaste {
         }
 
         if target.bundleIdentifier == "com.cmuxterm.app" {
-            guard let cmuxTarget = target.cmuxTarget else {
+            let cmuxTarget = target.cmuxTarget ?? captureCmuxTarget(app: NSRunningApplication(processIdentifier: target.pid))
+            guard let cmuxTarget else {
                 return .failedWithoutFallback("cmux-target-unavailable")
             }
 
@@ -335,17 +336,31 @@ private enum BackgroundPaste {
 
     private static func captureCmuxTarget(app: NSRunningApplication?) -> CmuxPasteTarget? {
         guard app?.bundleIdentifier == "com.cmuxterm.app" else { return nil }
-        guard let cliPath = cmuxCLIPath(app: app) else { return nil }
-        guard let data = runProcess(
+        guard let cliPath = cmuxCLIPath(app: app) else {
+            log("cmux-identify skipped reason=cli-missing")
+            return nil
+        }
+        guard let data = runCmuxProcess(
             executablePath: cliPath,
-            arguments: ["identify", "--no-caller"]
-        ), let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let focused = json["focused"] as? [String: Any],
-              let surfaceType = focused["surface_type"] as? String,
-              surfaceType == "terminal",
-              let windowRef = focused["window_ref"] as? String,
+            arguments: ["identify", "--no-caller"],
+            operation: "identify"
+        ) else {
+            return nil
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let focused = json["focused"] as? [String: Any] else {
+            log("cmux-identify failed reason=invalid-json output=\(String(data: data, encoding: .utf8) ?? "")")
+            return nil
+        }
+        guard let surfaceType = focused["surface_type"] as? String,
+              surfaceType == "terminal" else {
+            log("cmux-identify failed reason=focused-surface-not-terminal surfaceType=\(String(describing: focused["surface_type"]))")
+            return nil
+        }
+        guard let windowRef = focused["window_ref"] as? String,
               let workspaceRef = focused["workspace_ref"] as? String,
               let surfaceRef = focused["surface_ref"] as? String else {
+            log("cmux-identify failed reason=missing-refs focused=\(focused)")
             return nil
         }
 
@@ -369,6 +384,7 @@ private enum BackgroundPaste {
                 "--window", target.windowRef,
                 "--workspace", target.workspaceRef,
                 "--surface", target.surfaceRef,
+                "--",
                 text
             ]
         ) != nil
@@ -383,23 +399,63 @@ private enum BackgroundPaste {
         return candidateURLs.first { FileManager.default.isExecutableFile(atPath: $0.path) }?.path
     }
 
-    private static func runProcess(executablePath: String, arguments: [String]) -> Data? {
+    private struct ProcessOutput {
+        let stdout: Data
+        let stderr: String
+        let exitCode: Int32
+    }
+
+    private static func runCmuxProcess(
+        executablePath: String,
+        arguments: [String],
+        operation: String,
+        attempts: Int = 2
+    ) -> Data? {
+        for attempt in 1...attempts {
+            guard let result = runProcess(executablePath: executablePath, arguments: arguments) else {
+                log("cmux-\(operation) failed attempt=\(attempt) reason=process-launch")
+                continue
+            }
+
+            if result.exitCode == 0 {
+                return result.stdout
+            }
+
+            log("cmux-\(operation) failed attempt=\(attempt) exit=\(result.exitCode) stderr=\(result.stderr)")
+            Thread.sleep(forTimeInterval: 0.06)
+        }
+
+        return nil
+    }
+
+    private static func runProcess(executablePath: String, arguments: [String]) -> ProcessOutput? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = arguments
 
         let output = Pipe()
+        let error = Pipe()
         process.standardOutput = output
-        process.standardError = Pipe()
+        process.standardError = error
 
         do {
             try process.run()
             process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return nil }
-            return output.fileHandleForReading.readDataToEndOfFile()
+            let stdout = output.fileHandleForReading.readDataToEndOfFile()
+            let stderr = error.fileHandleForReading.readDataToEndOfFile()
+            return ProcessOutput(
+                stdout: stdout,
+                stderr: String(data: stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+                exitCode: process.terminationStatus
+            )
         } catch {
+            log("process failed executable=\(executablePath) error=\(error.localizedDescription)")
             return nil
         }
+    }
+
+    private static func log(_ message: String) {
+        DebugLog.append(message, to: "/tmp/wire-transcribe.log")
     }
 
     private static func valueChanged(
