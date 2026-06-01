@@ -213,8 +213,8 @@ private enum BackgroundPaste {
                 return .failedWithoutFallback("cmux-target-unavailable")
             }
 
-            guard sendToCmux(text, target: cmuxTarget) else {
-                return .failedWithoutFallback("cmux-send-failed")
+            if let sendFailure = sendToCmux(text, target: cmuxTarget) {
+                return .failedWithoutFallback(sendFailure)
             }
 
             return .inserted("cmux-send")
@@ -372,12 +372,12 @@ private enum BackgroundPaste {
         )
     }
 
-    private static func sendToCmux(_ text: String, target: CmuxPasteTarget) -> Bool {
+    private static func sendToCmux(_ text: String, target: CmuxPasteTarget) -> String? {
         guard !text.contains("\n"), !text.contains("\r") else {
-            return false
+            return "cmux-send-unsupported-newline"
         }
 
-        return runProcess(
+        guard runCmuxProcess(
             executablePath: target.cliPath,
             arguments: cmuxArguments([
                 "send",
@@ -386,8 +386,13 @@ private enum BackgroundPaste {
                 "--surface", target.surfaceRef,
                 "--",
                 text
-            ])
-        ) != nil
+            ]),
+            operation: "send"
+        ) != nil else {
+            return "cmux-send-failed"
+        }
+
+        return nil
     }
 
     private static func cmuxCLIPath(app: NSRunningApplication?) -> String? {
@@ -430,11 +435,34 @@ private enum BackgroundPaste {
                 return result.stdout
             }
 
-            log("cmux-\(operation) failed attempt=\(attempt) exit=\(result.exitCode) stderr=\(result.stderr)")
+            log("cmux-\(operation) failed attempt=\(attempt) mode=direct exit=\(result.exitCode) stderr=\(result.stderr) argv=\(sanitizedCmuxArgv(executablePath: executablePath, arguments: arguments, operation: operation))")
+            if let shellResult = runProcess(executablePath: "/bin/zsh", arguments: ["-lc", shellCommand(executablePath: executablePath, arguments: arguments)]) {
+                if shellResult.exitCode == 0 {
+                    log("cmux-\(operation) recovered attempt=\(attempt) mode=shell")
+                    return shellResult.stdout
+                }
+                log("cmux-\(operation) failed attempt=\(attempt) mode=shell exit=\(shellResult.exitCode) stderr=\(shellResult.stderr)")
+            }
             Thread.sleep(forTimeInterval: 0.06)
         }
 
         return nil
+    }
+
+    private static func shellCommand(executablePath: String, arguments: [String]) -> String {
+        ([executablePath] + arguments).map(shellQuote).joined(separator: " ")
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func sanitizedCmuxArgv(executablePath: String, arguments: [String], operation: String) -> String {
+        var values = [executablePath] + arguments
+        if operation == "send", !values.isEmpty {
+            values[values.count - 1] = "<text>"
+        }
+        return values.joined(separator: " ")
     }
 
     private static func runProcess(executablePath: String, arguments: [String]) -> ProcessOutput? {
