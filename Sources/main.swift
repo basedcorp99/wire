@@ -171,7 +171,7 @@ private enum BackgroundPaste {
         let subrole = stringAttribute(kAXSubroleAttribute as CFString, from: element)
         let title = stringAttribute(kAXTitleAttribute as CFString, from: element)
         let selectedRange = selectedTextRange(from: element)
-        let cmuxTarget = captureCmuxTarget(app: app)
+        let cmuxTarget = app?.bundleIdentifier == "com.cmuxterm.app" ? nil : captureCmuxTarget(app: app)
         let summaryParts = [
             app?.localizedName,
             app?.bundleIdentifier,
@@ -208,16 +208,7 @@ private enum BackgroundPaste {
         }
 
         if target.bundleIdentifier == "com.cmuxterm.app" {
-            let cmuxTarget = target.cmuxTarget ?? captureCmuxTarget(app: NSRunningApplication(processIdentifier: target.pid))
-            guard let cmuxTarget else {
-                return .failedWithoutFallback("cmux-target-unavailable")
-            }
-
-            if let sendFailure = sendToCmux(text, target: cmuxTarget) {
-                return .failedWithoutFallback(sendFailure)
-            }
-
-            return .inserted("cmux-send")
+            return insertIntoCmuxTextArea(text, target: target)
         }
 
         guard let initialValue = stringAttribute(kAXValueAttribute as CFString, from: target.element) else {
@@ -296,6 +287,26 @@ private enum BackgroundPaste {
         let insertionLocation = range.location + (text as NSString).length
         _ = setSelectedTextRange(CFRange(location: insertionLocation, length: 0), on: element)
         return .inserted("value")
+    }
+
+    private static func insertIntoCmuxTextArea(_ text: String, target: BackgroundPasteTarget) -> BackgroundPasteResult {
+        guard let range = target.selectedTextRange else {
+            return .failedWithoutFallback("cmux-target-has-no-selected-text-range")
+        }
+
+        let restoreSelectionStatus = setSelectedTextRange(range, on: target.element)
+        let selectedTextStatus = AXUIElementSetAttributeValue(
+            target.element,
+            kAXSelectedTextAttribute as CFString,
+            text as CFTypeRef
+        )
+        guard selectedTextStatus == .success else {
+            return .failedWithoutFallback("cmux-selectedText=\(selectedTextStatus.wireDescription) restoreSelection=\(restoreSelectionStatus.wireDescription)")
+        }
+
+        let insertionLocation = range.location + (text as NSString).length
+        _ = setSelectedTextRange(CFRange(location: insertionLocation, length: 0), on: target.element)
+        return .inserted("cmux-selected-text")
     }
 
     private static func focusedElement() -> AXUIElement? {
