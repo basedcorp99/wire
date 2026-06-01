@@ -128,6 +128,411 @@ enum Clipboard {
     }
 }
 
+// MARK: - Background Paste Target
+
+private struct BackgroundPasteTarget {
+    let pid: pid_t
+    let bundleIdentifier: String?
+    let element: AXUIElement
+    let selectedTextRange: CFRange?
+    let cmuxTarget: CmuxPasteTarget?
+    let summary: String
+}
+
+private struct CmuxPasteTarget {
+    let cliPath: String
+    let windowRef: String
+    let workspaceRef: String
+    let surfaceRef: String
+}
+
+private enum BackgroundPasteResult {
+    case inserted(String)
+    case failed(String)
+}
+
+private enum BackgroundPaste {
+    static func captureIfTrusted() -> BackgroundPasteTarget? {
+        guard AXIsProcessTrusted() else { return nil }
+
+        guard let element = focusedElement() else {
+            return nil
+        }
+
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success,
+              pid != ProcessInfo.processInfo.processIdentifier else {
+            return nil
+        }
+
+        let app = NSRunningApplication(processIdentifier: pid)
+        let role = stringAttribute(kAXRoleAttribute as CFString, from: element)
+        let subrole = stringAttribute(kAXSubroleAttribute as CFString, from: element)
+        let title = stringAttribute(kAXTitleAttribute as CFString, from: element)
+        let selectedRange = selectedTextRange(from: element)
+        let cmuxTarget = captureCmuxTarget(app: app)
+        let summaryParts = [
+            app?.localizedName,
+            app?.bundleIdentifier,
+            role,
+            subrole,
+            title
+        ].compactMap { value -> String? in
+            guard let value, !value.isEmpty else { return nil }
+            return value
+        }
+        let summary = summaryParts.joined(separator: " ")
+
+        return BackgroundPasteTarget(
+            pid: pid,
+            bundleIdentifier: app?.bundleIdentifier,
+            element: element,
+            selectedTextRange: selectedRange,
+            cmuxTarget: cmuxTarget,
+            summary: summary.isEmpty ? "pid=\(pid)" : summary
+        )
+    }
+
+    static func insert(_ text: String, into target: BackgroundPasteTarget) -> BackgroundPasteResult {
+        guard AXIsProcessTrusted() else {
+            return .failed("accessibility-not-trusted")
+        }
+
+        guard NSRunningApplication(processIdentifier: target.pid) != nil else {
+            return .failed("target-app-not-running")
+        }
+
+        guard elementStillExists(target.element) else {
+            return .failed("target-element-missing")
+        }
+
+        if let cmuxTarget = target.cmuxTarget,
+           sendToCmux(text, target: cmuxTarget) {
+            return .inserted("cmux-send")
+        }
+
+        guard let initialValue = stringAttribute(kAXValueAttribute as CFString, from: target.element) else {
+            return .failed("target-has-no-verifiable-text-value")
+        }
+
+        if let range = target.selectedTextRange {
+            let restoreSelectionStatus = setSelectedTextRange(range, on: target.element)
+            let selectedTextStatus = AXUIElementSetAttributeValue(
+                target.element,
+                kAXSelectedTextAttribute as CFString,
+                text as CFTypeRef
+            )
+            if selectedTextStatus == .success,
+               valueChanged(from: initialValue, inserting: text, on: target.element) {
+                let insertionLocation = range.location + (text as NSString).length
+                _ = setSelectedTextRange(CFRange(location: insertionLocation, length: 0), on: target.element)
+                return .inserted("selected-text")
+            }
+
+            var failureReasons = [
+                "selectedText=\(selectedTextStatus.wireDescription)",
+                "restoreSelection=\(restoreSelectionStatus.wireDescription)"
+            ]
+
+            if let valueResult = insertByReplacingValue(
+                text,
+                range: range,
+                initialValue: initialValue,
+                element: target.element
+            ) {
+                if case .inserted = valueResult {
+                    return valueResult
+                } else if case .failed(let reason) = valueResult {
+                    failureReasons.append(reason)
+                }
+            }
+
+            return .failed(failureReasons.joined(separator: " "))
+        }
+
+        return .failed("target-has-no-selected-text-range")
+    }
+
+    private static func insertByReplacingValue(
+        _ text: String,
+        range: CFRange,
+        initialValue: String?,
+        element: AXUIElement
+    ) -> BackgroundPasteResult? {
+        guard isAttributeSettable(kAXValueAttribute as CFString, on: element) else {
+            return nil
+        }
+
+        guard let currentValue = initialValue ?? stringAttribute(kAXValueAttribute as CFString, from: element) else {
+            return .failed("target-value-unavailable")
+        }
+
+        guard let updatedValue = currentValue.replacingUTF16Range(range, with: text) else {
+            return .failed("target-selection-out-of-range")
+        }
+
+        let setValueStatus = AXUIElementSetAttributeValue(
+            element,
+            kAXValueAttribute as CFString,
+            updatedValue as CFTypeRef
+        )
+        guard setValueStatus == .success else {
+            return .failed("setValue=\(setValueStatus.wireDescription)")
+        }
+
+        guard valueChanged(from: currentValue, inserting: text, on: element) else {
+            return .failed("setValue-unverified")
+        }
+
+        let insertionLocation = range.location + (text as NSString).length
+        _ = setSelectedTextRange(CFRange(location: insertionLocation, length: 0), on: element)
+        return .inserted("value")
+    }
+
+    private static func focusedElement() -> AXUIElement? {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedValue: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedValue
+        ) == .success, let focusedValue,
+           CFGetTypeID(focusedValue) == AXUIElementGetTypeID() {
+            return (focusedValue as! AXUIElement)
+        }
+
+        var appValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedApplicationAttribute as CFString,
+            &appValue
+        ) == .success, let appValue,
+              CFGetTypeID(appValue) == AXUIElementGetTypeID() else {
+            return nil
+        }
+
+        let appElement = appValue as! AXUIElement
+        var nestedFocusedValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            appElement,
+            kAXFocusedUIElementAttribute as CFString,
+            &nestedFocusedValue
+        ) == .success, let nestedFocusedValue,
+              CFGetTypeID(nestedFocusedValue) == AXUIElementGetTypeID() else {
+            return nil
+        }
+
+        return (nestedFocusedValue as! AXUIElement)
+    }
+
+    private static func captureCmuxTarget(app: NSRunningApplication?) -> CmuxPasteTarget? {
+        guard app?.bundleIdentifier == "com.cmuxterm.app" else { return nil }
+        guard let cliPath = cmuxCLIPath(app: app) else { return nil }
+        guard let data = runProcess(
+            executablePath: cliPath,
+            arguments: ["identify", "--no-caller"]
+        ), let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let focused = json["focused"] as? [String: Any],
+              let surfaceType = focused["surface_type"] as? String,
+              surfaceType == "terminal",
+              let windowRef = focused["window_ref"] as? String,
+              let workspaceRef = focused["workspace_ref"] as? String,
+              let surfaceRef = focused["surface_ref"] as? String else {
+            return nil
+        }
+
+        return CmuxPasteTarget(
+            cliPath: cliPath,
+            windowRef: windowRef,
+            workspaceRef: workspaceRef,
+            surfaceRef: surfaceRef
+        )
+    }
+
+    private static func sendToCmux(_ text: String, target: CmuxPasteTarget) -> Bool {
+        guard !text.contains("\n"), !text.contains("\r") else {
+            return false
+        }
+
+        return runProcess(
+            executablePath: target.cliPath,
+            arguments: [
+                "send",
+                "--window", target.windowRef,
+                "--workspace", target.workspaceRef,
+                "--surface", target.surfaceRef,
+                text
+            ]
+        ) != nil
+    }
+
+    private static func cmuxCLIPath(app: NSRunningApplication?) -> String? {
+        let candidateURLs = [
+            app?.bundleURL?.appendingPathComponent("Contents/Resources/bin/cmux"),
+            URL(fileURLWithPath: "/Applications/cmux.app/Contents/Resources/bin/cmux")
+        ].compactMap { $0 }
+
+        return candidateURLs.first { FileManager.default.isExecutableFile(atPath: $0.path) }?.path
+    }
+
+    private static func runProcess(executablePath: String, arguments: [String]) -> Data? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            return output.fileHandleForReading.readDataToEndOfFile()
+        } catch {
+            return nil
+        }
+    }
+
+    private static func valueChanged(
+        from initialValue: String?,
+        inserting text: String,
+        on element: AXUIElement
+    ) -> Bool {
+        guard let initialValue else { return false }
+
+        for _ in 0..<5 {
+            Thread.sleep(forTimeInterval: 0.04)
+            guard let updatedValue = stringAttribute(kAXValueAttribute as CFString, from: element) else {
+                return false
+            }
+            if updatedValue != initialValue && updatedValue.contains(text) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private static func selectedTextRange(from element: AXUIElement) -> CFRange? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            &value
+        ) == .success, let value,
+              CFGetTypeID(value) == AXValueGetTypeID() else {
+            return nil
+        }
+        let axValue = value as! AXValue
+        guard
+              AXValueGetType(axValue) == .cfRange else {
+            return nil
+        }
+
+        var range = CFRange()
+        guard AXValueGetValue(axValue, .cfRange, &range) else { return nil }
+        return range
+    }
+
+    private static func setSelectedTextRange(_ range: CFRange, on element: AXUIElement) -> AXError {
+        var mutableRange = range
+        guard let axRange = AXValueCreate(.cfRange, &mutableRange) else {
+            return .failure
+        }
+        return AXUIElementSetAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            axRange
+        )
+    }
+
+    private static func elementStillExists(_ element: AXUIElement) -> Bool {
+        var value: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
+        return status == .success
+    }
+
+    private static func isAttributeSettable(_ attribute: CFString, on element: AXUIElement) -> Bool {
+        var settable = DarwinBoolean(false)
+        let status = AXUIElementIsAttributeSettable(element, attribute, &settable)
+        return status == .success && settable.boolValue
+    }
+
+    private static func stringAttribute(_ attribute: CFString, from element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+            return nil
+        }
+        return value as? String
+    }
+}
+
+private extension String {
+    func replacingUTF16Range(_ range: CFRange, with replacement: String) -> String? {
+        guard range.location >= 0, range.length >= 0 else { return nil }
+
+        let utf16View = utf16
+        guard let lowerUTF16 = utf16View.index(
+            utf16View.startIndex,
+            offsetBy: range.location,
+            limitedBy: utf16View.endIndex
+        ), let upperUTF16 = utf16View.index(
+            lowerUTF16,
+            offsetBy: range.length,
+            limitedBy: utf16View.endIndex
+        ), let lower = String.Index(lowerUTF16, within: self),
+           let upper = String.Index(upperUTF16, within: self) else {
+            return nil
+        }
+
+        var updated = self
+        updated.replaceSubrange(lower..<upper, with: replacement)
+        return updated
+    }
+}
+
+private extension AXError {
+    var wireDescription: String {
+        switch self {
+        case .success:
+            return "success"
+        case .failure:
+            return "failure"
+        case .illegalArgument:
+            return "illegal-argument"
+        case .invalidUIElement:
+            return "invalid-ui-element"
+        case .invalidUIElementObserver:
+            return "invalid-ui-element-observer"
+        case .cannotComplete:
+            return "cannot-complete"
+        case .attributeUnsupported:
+            return "attribute-unsupported"
+        case .actionUnsupported:
+            return "action-unsupported"
+        case .notificationUnsupported:
+            return "notification-unsupported"
+        case .notImplemented:
+            return "not-implemented"
+        case .notificationAlreadyRegistered:
+            return "notification-already-registered"
+        case .notificationNotRegistered:
+            return "notification-not-registered"
+        case .apiDisabled:
+            return "api-disabled"
+        case .noValue:
+            return "no-value"
+        case .parameterizedAttributeUnsupported:
+            return "parameterized-attribute-unsupported"
+        case .notEnoughPrecision:
+            return "not-enough-precision"
+        @unknown default:
+            return "unknown-\(rawValue)"
+        }
+    }
+}
+
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -155,6 +560,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let wasStartedByAirPods: Bool
         let kind: HotKeyKind?
         let source: String
+        let pasteTarget: BackgroundPasteTarget?
     }
 
     private let state = AppState()
@@ -175,6 +581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var airPodsSubmitEligible = false
     private var activeRecordingStartedByHeadsetHold = false
     private var activeRecordingSource = ""
+    private var activeRecordingPasteTarget: BackgroundPasteTarget?
     private var airPodsMuteStateObserver: NSObjectProtocol?
     private var lastAirPodsMuteToggleAt: Date?
     private var airPodsLastVoiceAt: Date?
@@ -289,6 +696,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runAirPodsCaptureSelfTestIfRequested()
         runHeadsetPathSelfTestIfRequested()
         runDefaultCaptureSelfTestIfRequested()
+        runBackgroundPasteSelfTestIfRequested()
+    }
+
+    private func runBackgroundPasteSelfTestIfRequested() {
+        guard let text = ProcessInfo.processInfo.environment["WIRE_SELF_TEST_BACKGROUND_PASTE_TEXT"] else {
+            return
+        }
+
+        let outputURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["WIRE_SELF_TEST_OUTPUT"] ?? "/tmp/wire-background-paste-self-test.txt")
+        let captureDelay = Double(ProcessInfo.processInfo.environment["WIRE_SELF_TEST_BACKGROUND_CAPTURE_DELAY"] ?? "0.7") ?? 0.7
+        let pasteDelay = Double(ProcessInfo.processInfo.environment["WIRE_SELF_TEST_BACKGROUND_PASTE_DELAY"] ?? "2.5") ?? 2.5
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, captureDelay) * 1_000_000_000))
+            let target = BackgroundPaste.captureIfTrusted()
+            let capturedSummary = target?.summary ?? "none"
+            Self.appendTranscriptionDebugLog("background-self-test captured target=\(capturedSummary)")
+
+            try? await Task.sleep(nanoseconds: UInt64(max(0, pasteDelay) * 1_000_000_000))
+            state.transcriptionStage = .done
+            state.lastTranscription = text
+            let frontmostBeforePaste = NSWorkspace.shared.frontmostApplication?.localizedName ?? "none"
+            let result = pasteTranscript(text, target: target, pressReturnAfterPaste: false)
+            let frontmostAfterPaste = NSWorkspace.shared.frontmostApplication?.localizedName ?? "none"
+            let lines = [
+                "target=\(capturedSummary)",
+                "frontmostBeforePaste=\(frontmostBeforePaste)",
+                "frontmostAfterPaste=\(frontmostAfterPaste)",
+                "result=\(result)",
+                "text=\(text)"
+            ]
+            try? (lines.joined(separator: "\n") + "\n").write(to: outputURL, atomically: true, encoding: .utf8)
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            NSApp.terminate(nil)
+        }
     }
 
     private func runAirPodsCaptureSelfTestIfRequested() {
@@ -831,6 +1273,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startedByHeadsetHold: Bool = false,
         source: String
     ) {
+        let pasteTarget = BackgroundPaste.captureIfTrusted()
+
         if kind == .hold {
             holdRecordingStartPending = true
             stopHoldWhenRecordingStarts = false
@@ -874,12 +1318,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 activeRecordingStartedByAirPods = startedByAirPods
                 activeRecordingStartedByHeadsetHold = startedByHeadsetHold
                 activeRecordingSource = source
+                activeRecordingPasteTarget = pasteTarget
                 airPodsLastVoiceAt = startedByAirPods ? Date() : nil
                 airPodsPeakRMS = 0
                 airPodsLastLevelLogAt = nil
                 airPodsAutoStopArmed = false
                 let inputDeviceName = inputDeviceID.flatMap { DefaultAudioInputOverride.audioDeviceName($0) } ?? "default"
-                Self.appendTranscriptionDebugLog("start source=\(source) kind=\(kind) builtIn=\(useBuiltInInput) airPodsInput=\(useAirPodsInput) inputDevice=\(inputDeviceName) headsetHold=\(startedByHeadsetHold) airpods=\(startedByAirPods)")
+                let pasteTargetSummary = pasteTarget?.summary ?? "none"
+                Self.appendTranscriptionDebugLog("start source=\(source) kind=\(kind) builtIn=\(useBuiltInInput) airPodsInput=\(useAirPodsInput) inputDevice=\(inputDeviceName) headsetHold=\(startedByHeadsetHold) airpods=\(startedByAirPods) pasteTarget=\(pasteTargetSummary)")
                 let shouldStopImmediately = kind == .hold && stopHoldWhenRecordingStarts
                 if kind == .hold {
                     Self.appendHeadsetDebugLog("app start-hold active=true stopImmediately=\(shouldStopImmediately) source=\(source)")
@@ -891,6 +1337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } catch {
                 clearPendingHoldStartIfNeeded(kind: kind)
+                activeRecordingPasteTarget = nil
                 state.statusText = "Could not start recording: \(error.localizedDescription)"
                 Self.appendTranscriptionDebugLog("start failed source=\(source) kind=\(kind) error=\(error.localizedDescription)")
                 if hasPendingTranscriptions {
@@ -922,12 +1369,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let wasStartedByHeadsetHold = activeRecordingStartedByHeadsetHold
             let stoppedRecordingKind = activeRecordingKind
             let stoppedRecordingSource = activeRecordingSource
+            let pasteTarget = activeRecordingPasteTarget
             stopRecordingStatusTimer()
             activeRecordingKind = nil
             activeRecordingShouldPressReturn = false
             activeRecordingStartedByAirPods = false
             activeRecordingStartedByHeadsetHold = false
             activeRecordingSource = ""
+            activeRecordingPasteTarget = nil
             airPodsLastVoiceAt = nil
             airPodsPeakRMS = 0
             airPodsLastLevelLogAt = nil
@@ -972,7 +1421,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 retryASRFailure: wasStartedByAirPods,
                 wasStartedByAirPods: wasStartedByAirPods,
                 kind: stoppedRecordingKind,
-                source: stoppedRecordingSource
+                source: stoppedRecordingSource,
+                pasteTarget: pasteTarget
             )
         }
     }
@@ -995,6 +1445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wasStartedByAirPods: Bool,
         kind: HotKeyKind?,
         source: String,
+        pasteTarget: BackgroundPasteTarget? = nil,
         recoveryURL existingRecoveryURL: URL? = nil
     ) {
         let id = nextTranscriptionJobID
@@ -1008,7 +1459,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             retryASRFailure: retryASRFailure,
             wasStartedByAirPods: wasStartedByAirPods,
             kind: kind,
-            source: source
+            source: source,
+            pasteTarget: pasteTarget
         )
 
         queuedTranscriptionJobs.append(job)
@@ -1020,7 +1472,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ? "Loading… uploading \(audioData.count / 1024) KB"
                 : transcriptionQueueStatusText()
         }
-        Self.appendTranscriptionDebugLog("enqueue id=\(id) source=\(source) kind=\(String(describing: kind)) bytes=\(audioData.count) pending=\(pendingTranscriptionCount)")
+        Self.appendTranscriptionDebugLog("enqueue id=\(id) source=\(source) kind=\(String(describing: kind)) bytes=\(audioData.count) pending=\(pendingTranscriptionCount) pasteTarget=\(pasteTarget?.summary ?? "none")")
         startTranscriptionQueueWorkerIfNeeded()
     }
 
@@ -1079,7 +1531,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Self.appendTranscriptionDebugLog("done id=\(job.id) source=\(job.source) kind=\(String(describing: job.kind)) textChars=\(text.count) clipboard=\(copiedToClipboard) remaining=\(queuedTranscriptionJobs.count)")
 
             if !handleComputerTranscript(text) {
-                typeText(text, pressReturnAfterPaste: job.shouldPressReturnAfterPaste)
+                pasteTranscript(
+                    text,
+                    target: job.pasteTarget,
+                    pressReturnAfterPaste: job.shouldPressReturnAfterPaste
+                )
             }
 
             let pasteDelay: UInt64 = job.shouldPressReturnAfterPaste ? 260_000_000 : 120_000_000
@@ -1402,6 +1858,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let duration = Double(samples) / Double(sampleRate * channels)
         let rms = sqrt(sumSquares / Double(samples))
         return (duration, rms, peak)
+    }
+
+    @discardableResult
+    private func pasteTranscript(
+        _ text: String,
+        target: BackgroundPasteTarget?,
+        pressReturnAfterPaste: Bool
+    ) -> String {
+        if let target {
+            switch BackgroundPaste.insert(text, into: target) {
+            case .inserted(let method):
+                Self.appendTranscriptionDebugLog("background-paste success method=\(method) target=\(target.summary)")
+                state.statusText = "Pasted to original app"
+                showMenuBarFeedback("Pasted")
+                if pressReturnAfterPaste {
+                    Self.appendTranscriptionDebugLog("background-paste return skipped reason=background-key-events-unsupported target=\(target.summary)")
+                }
+                return "background:\(method)"
+            case .failed(let reason):
+                Self.appendTranscriptionDebugLog("background-paste failed reason=\(reason) target=\(target.summary)")
+            }
+        } else {
+            Self.appendTranscriptionDebugLog("background-paste skipped reason=no-target")
+        }
+
+        typeText(text, pressReturnAfterPaste: pressReturnAfterPaste)
+        state.statusText = "Pasted to current app"
+        showMenuBarFeedback("Pasted here")
+        return "foreground-fallback"
     }
 
     private func typeText(_ text: String, pressReturnAfterPaste: Bool) {
