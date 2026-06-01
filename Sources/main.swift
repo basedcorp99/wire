@@ -364,7 +364,13 @@ private enum BackgroundPaste {
 
         return runProcess(
             executablePath: target.cliPath,
-            arguments: ["send", text]
+            arguments: [
+                "send",
+                "--window", target.windowRef,
+                "--workspace", target.workspaceRef,
+                "--surface", target.surfaceRef,
+                text
+            ]
         ) != nil
     }
 
@@ -548,6 +554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let computerHarnessCommandDefaultsKey = "computerHarnessCommand"
     private static let defaultComputerHarnessCommand = "codex --yolo -c 'model_reasoning_effort=\"low\"' e {{prompt}}"
     private static let cleanupEnabledDefaultsKey = "cleanupEnabled"
+    private static let backgroundPasteEnabledDefaultsKey = "backgroundPasteEnabled"
     private static let airPodsAutoStopSilenceSeconds: TimeInterval = 1.4
     private static let airPodsAutoStopMinimumSeconds: TimeInterval = 1.2
     private static let airPodsMinimumVoiceRMS: Float = 140
@@ -630,6 +637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.computerCustomHarnessEnabled = UserDefaults.standard.bool(forKey: Self.computerCustomHarnessEnabledDefaultsKey)
         state.computerHarnessCommand = UserDefaults.standard.string(forKey: Self.computerHarnessCommandDefaultsKey) ?? Self.defaultComputerHarnessCommand
         state.cleanupEnabled = (UserDefaults.standard.object(forKey: Self.cleanupEnabledDefaultsKey) as? Bool) ?? true
+        state.backgroundPasteEnabled = (UserDefaults.standard.object(forKey: Self.backgroundPasteEnabledDefaultsKey) as? Bool) ?? true
 
         // Initialize components
         codexClient = CodexAPIClient()
@@ -1277,7 +1285,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startedByHeadsetHold: Bool = false,
         source: String
     ) {
-        let pasteTarget = BackgroundPaste.captureIfTrusted()
+        let pasteTarget = state.backgroundPasteEnabled ? BackgroundPaste.captureIfTrusted() : nil
 
         if kind == .hold {
             holdRecordingStartPending = true
@@ -1328,7 +1336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 airPodsLastLevelLogAt = nil
                 airPodsAutoStopArmed = false
                 let inputDeviceName = inputDeviceID.flatMap { DefaultAudioInputOverride.audioDeviceName($0) } ?? "default"
-                let pasteTargetSummary = pasteTarget?.summary ?? "none"
+                let pasteTargetSummary = state.backgroundPasteEnabled ? (pasteTarget?.summary ?? "none") : "disabled"
                 Self.appendTranscriptionDebugLog("start source=\(source) kind=\(kind) builtIn=\(useBuiltInInput) airPodsInput=\(useAirPodsInput) inputDevice=\(inputDeviceName) headsetHold=\(startedByHeadsetHold) airpods=\(startedByAirPods) pasteTarget=\(pasteTargetSummary)")
                 let shouldStopImmediately = kind == .hold && stopHoldWhenRecordingStarts
                 if kind == .hold {
@@ -2172,6 +2180,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.statusText = enabled ? "Cleanup enabled" : "Cleanup disabled"
     }
 
+    func setBackgroundPasteEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.backgroundPasteEnabledDefaultsKey)
+        state.backgroundPasteEnabled = enabled
+        state.statusText = enabled ? "Paste to source app enabled" : "Pasting to active app only"
+    }
+
     private func pressReturnKey() {
         let source = CGEventSource(stateID: .hidSystemState)
         let returnKey = CGKeyCode(kVK_Return)
@@ -2220,6 +2234,7 @@ final class AppState {
     var computerHarnessCommand = "" { didSet { onChange?() } }
     var computerCommandRunning = false { didSet { onChange?() } }
     var cleanupEnabled = true { didSet { onChange?() } }
+    var backgroundPasteEnabled = true { didSet { onChange?() } }
 
     private static func recoverableRecordingExistsOnDisk() -> Bool {
         if FileManager.default.fileExists(atPath: "/tmp/wire-recoverable-recording.wav") {
@@ -4115,6 +4130,8 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private let headsetControlsSwitch = NSSwitch()
     private let sendEnterAfterPasteSwitch = NSSwitch()
     private let cleanupSwitch = NSSwitch()
+    private let backgroundPasteSwitch = NSSwitch()
+    private let backgroundPasteInfoButton = NSButton(title: "", target: nil, action: nil)
     private let airPodsControlSwitch = NSSwitch()
     private let airPodsInfoButton = NSButton(title: "", target: nil, action: nil)
     private let computerControlsSwitch = NSSwitch()
@@ -4134,6 +4151,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private var computerAutoEnableRows: [NSView] = []
     private var computerHarnessRows: [NSView] = []
     private var headsetCollapsedSpacer: NSView?
+    private var backgroundPasteInfoPopover: NSPopover?
     private var airPodsInfoPopover: NSPopover?
     private var computerInfoPopover: NSPopover?
     private var computerHarnessInfoPopover: NSPopover?
@@ -4304,6 +4322,11 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         configureSwitch(cleanupSwitch, action: #selector(toggleCleanup))
         let cleanupRow = menuRow(symbol: "text.badge.checkmark", title: "Clean up transcript", trailing: cleanupSwitch)
         rootStack.addArrangedSubview(cleanupRow)
+
+        configureSwitch(backgroundPasteSwitch, action: #selector(toggleBackgroundPaste))
+        configureInfoButton(backgroundPasteInfoButton, action: #selector(showBackgroundPasteInfo), accessibilityDescription: "Paste to source app details")
+        let backgroundPasteRow = menuRow(symbol: "arrowshape.turn.up.left", title: "Paste to source app", trailing: trailingGroup([backgroundPasteInfoButton, backgroundPasteSwitch]))
+        rootStack.addArrangedSubview(backgroundPasteRow)
         rootStack.addArrangedSubview(spacer(height: 8))
 
         rootStack.addArrangedSubview(divider())
@@ -4326,17 +4349,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         rootStack.addArrangedSubview(sendEnterRow)
 
         configureSwitch(airPodsControlSwitch, action: #selector(toggleAirPodsControl))
-        airPodsInfoButton.bezelStyle = .inline
-        airPodsInfoButton.isBordered = false
-        airPodsInfoButton.imagePosition = .imageOnly
-        airPodsInfoButton.target = self
-        airPodsInfoButton.action = #selector(showAirPodsInfo)
-        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Experimental AirPods details") {
-            infoImage.isTemplate = true
-            airPodsInfoButton.image = infoImage
-        }
-        airPodsInfoButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
-        airPodsInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        configureInfoButton(airPodsInfoButton, action: #selector(showAirPodsInfo), accessibilityDescription: "Experimental AirPods details")
         let airPodsControlRow = menuRow(symbol: "airpodspro", title: "AirPods controls (experimental)", trailing: trailingGroup([airPodsInfoButton, airPodsControlSwitch]))
         rootStack.addArrangedSubview(airPodsControlRow)
 
@@ -4347,31 +4360,11 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         rootStack.addArrangedSubview(divider())
         rootStack.addArrangedSubview(sectionLabel("Computer"))
         configureSwitch(computerControlsSwitch, action: #selector(toggleComputerControls))
-        computerInfoButton.bezelStyle = .inline
-        computerInfoButton.isBordered = false
-        computerInfoButton.imagePosition = .imageOnly
-        computerInfoButton.target = self
-        computerInfoButton.action = #selector(showComputerInfo)
-        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Computer mode details") {
-            infoImage.isTemplate = true
-            computerInfoButton.image = infoImage
-        }
-        computerInfoButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
-        computerInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        configureInfoButton(computerInfoButton, action: #selector(showComputerInfo), accessibilityDescription: "Computer mode details")
         rootStack.addArrangedSubview(menuRow(symbol: "desktopcomputer", title: "Computer mode (dangerous)", trailing: trailingGroup([computerInfoButton, computerControlsSwitch])))
 
         configureSwitch(computerCustomHarnessSwitch, action: #selector(toggleComputerCustomHarness))
-        computerHarnessInfoButton.bezelStyle = .inline
-        computerHarnessInfoButton.isBordered = false
-        computerHarnessInfoButton.imagePosition = .imageOnly
-        computerHarnessInfoButton.target = self
-        computerHarnessInfoButton.action = #selector(showComputerHarnessInfo)
-        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "Custom harness details") {
-            infoImage.isTemplate = true
-            computerHarnessInfoButton.image = infoImage
-        }
-        computerHarnessInfoButton.widthAnchor.constraint(equalToConstant: 20).isActive = true
-        computerHarnessInfoButton.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        configureInfoButton(computerHarnessInfoButton, action: #selector(showComputerHarnessInfo), accessibilityDescription: "Custom harness details")
         let customHarnessToggleRow = menuRow(symbol: "terminal", title: "Custom harness", trailing: trailingGroup([computerHarnessInfoButton, computerCustomHarnessSwitch]))
         rootStack.addArrangedSubview(customHarnessToggleRow)
 
@@ -4469,6 +4462,20 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         control.controlSize = .small
         control.widthAnchor.constraint(equalToConstant: 38).isActive = true
         control.heightAnchor.constraint(equalToConstant: 22).isActive = true
+    }
+
+    private func configureInfoButton(_ button: NSButton, action: Selector, accessibilityDescription: String) {
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.target = self
+        button.action = action
+        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: accessibilityDescription) {
+            infoImage.isTemplate = true
+            button.image = infoImage
+        }
+        button.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 20).isActive = true
     }
 
     private func menuRow(symbol: String, title: String, trailing: NSView) -> NSView {
@@ -4607,6 +4614,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             self.airPodsControlSwitch.state = self.headsetProbeManager.isAirPodsControlEnabled ? .on : .off
             self.sendEnterAfterPasteSwitch.state = self.state.sendEnterAfterPaste ? .on : .off
             self.cleanupSwitch.state = self.state.cleanupEnabled ? .on : .off
+            self.backgroundPasteSwitch.state = self.state.backgroundPasteEnabled ? .on : .off
             self.computerControlsSwitch.state = self.state.computerControlsEnabled ? .on : .off
             self.computerCustomHarnessSwitch.state = self.state.computerCustomHarnessEnabled ? .on : .off
             self.computerAutoEnableSwitch.state = self.state.computerAutoEnableEnabled ? .on : .off
@@ -4760,6 +4768,49 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     @objc private func toggleCleanup() {
         (NSApp.delegate as? AppDelegate)?.setCleanupEnabled(cleanupSwitch.state == .on)
         refresh()
+    }
+
+    @objc private func toggleBackgroundPaste() {
+        (NSApp.delegate as? AppDelegate)?.setBackgroundPasteEnabled(backgroundPasteSwitch.state == .on)
+        refresh()
+    }
+
+    @objc private func showBackgroundPasteInfo() {
+        if let backgroundPasteInfoPopover, backgroundPasteInfoPopover.isShown {
+            backgroundPasteInfoPopover.performClose(nil)
+            return
+        }
+
+        let label = NSTextField(labelWithString: "On: paste back into the app and text field where recording started, even if another window is active when transcription finishes.\nOff: copy the transcript, then paste once into the active window at finish time.")
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 0
+        label.preferredMaxLayoutWidth = 236
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 116))
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: 260),
+            container.heightAnchor.constraint(equalToConstant: 116),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10)
+        ])
+
+        let controller = NSViewController()
+        controller.view = container
+        controller.preferredContentSize = NSSize(width: 260, height: 116)
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 260, height: 116)
+        popover.contentViewController = controller
+        backgroundPasteInfoPopover = popover
+        popover.show(relativeTo: backgroundPasteInfoButton.bounds, of: backgroundPasteInfoButton, preferredEdge: .maxY)
     }
 
     @objc private func toggleComputerControls() {
