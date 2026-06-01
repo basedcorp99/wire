@@ -356,13 +356,7 @@ private enum BackgroundPaste {
 
         return runProcess(
             executablePath: target.cliPath,
-            arguments: [
-                "send",
-                "--window", target.windowRef,
-                "--workspace", target.workspaceRef,
-                "--surface", target.surfaceRef,
-                text
-            ]
+            arguments: ["send", text]
         ) != nil
     }
 
