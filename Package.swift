@@ -7,12 +7,17 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "wire", targets: ["wire"])
+        .executable(name: "wire", targets: ["wire"]),
+        .executable(name: "cmux-repro", targets: ["cmux-repro"])
     ],
     targets: [
         .executableTarget(
             name: "wire",
             path: "Sources"
+        ),
+        .executableTarget(
+            name: "cmux-repro",
+            path: "tools/CmuxRepro"
         )
     ]
 )

@@ -171,7 +171,7 @@ private enum BackgroundPaste {
         let subrole = stringAttribute(kAXSubroleAttribute as CFString, from: element)
         let title = stringAttribute(kAXTitleAttribute as CFString, from: element)
         let selectedRange = selectedTextRange(from: element)
-        let cmuxTarget = app?.bundleIdentifier == "com.cmuxterm.app" ? nil : captureCmuxTarget(app: app)
+        let cmuxTarget = app?.bundleIdentifier == "com.cmuxterm.app" ? captureCmuxTarget(app: app) : nil
         let summaryParts = [
             app?.localizedName,
             app?.bundleIdentifier,
@@ -208,6 +208,13 @@ private enum BackgroundPaste {
         }
 
         if target.bundleIdentifier == "com.cmuxterm.app" {
+            if let cmuxTarget = target.cmuxTarget {
+                if let failureReason = sendToCmux(text, target: cmuxTarget) {
+                    log("cmux-send failed reason=\(failureReason)")
+                } else {
+                    return .inserted("cmux-send")
+                }
+            }
             return pasteIntoCmuxProcess(text, target: target)
         }
 
@@ -391,10 +398,6 @@ private enum BackgroundPaste {
     }
 
     private static func sendToCmux(_ text: String, target: CmuxPasteTarget) -> String? {
-        guard !text.contains("\n"), !text.contains("\r") else {
-            return "cmux-send-unsupported-newline"
-        }
-
         guard runCmuxProcess(
             executablePath: target.cliPath,
             arguments: cmuxArguments([
@@ -403,7 +406,7 @@ private enum BackgroundPaste {
                 "--workspace", target.workspaceRef,
                 "--surface", target.surfaceRef,
                 "--",
-                text
+                cmuxEscapedText(text)
             ]),
             operation: "send"
         ) != nil else {
@@ -411,6 +414,14 @@ private enum BackgroundPaste {
         }
 
         return nil
+    }
+
+    private static func cmuxEscapedText(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
     }
 
     private static func cmuxCLIPath(app: NSRunningApplication?) -> String? {
@@ -2020,6 +2031,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ) -> String {
         if let target,
            target.bundleIdentifier == "com.cmuxterm.app",
+           target.cmuxTarget == nil,
            NSWorkspace.shared.frontmostApplication?.bundleIdentifier == target.bundleIdentifier {
             Self.appendTranscriptionDebugLog("background-paste skipped reason=cmux-frontmost target=\(target.summary)")
             typeText(text, pressReturnAfterPaste: pressReturnAfterPaste)
@@ -4908,7 +4920,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             return
         }
 
-        let label = NSTextField(labelWithString: "On: paste back into the app and text field where recording started, even if another window is active when transcription finishes.\nOff: copy the transcript, then paste once into the active window at finish time.")
+        let label = NSTextField(labelWithString: "On: paste back into the app and text field where recording started, even if another window is active when transcription finishes.\nOff: copy the transcript, then paste once into the active window at finish time.\nCMUX: enable Automation mode in CMUX for original tab/workspace targeting.")
         label.font = .systemFont(ofSize: 12)
         label.textColor = .labelColor
         label.lineBreakMode = .byWordWrapping
@@ -4916,12 +4928,12 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         label.preferredMaxLayoutWidth = 236
         label.translatesAutoresizingMaskIntoConstraints = false
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 116))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 150))
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(label)
         NSLayoutConstraint.activate([
             container.widthAnchor.constraint(equalToConstant: 260),
-            container.heightAnchor.constraint(equalToConstant: 116),
+            container.heightAnchor.constraint(equalToConstant: 150),
             label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
             label.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
@@ -4930,11 +4942,11 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
 
         let controller = NSViewController()
         controller.view = container
-        controller.preferredContentSize = NSSize(width: 260, height: 116)
+        controller.preferredContentSize = NSSize(width: 260, height: 150)
 
         let popover = NSPopover()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 260, height: 116)
+        popover.contentSize = NSSize(width: 260, height: 150)
         popover.contentViewController = controller
         backgroundPasteInfoPopover = popover
         popover.show(relativeTo: backgroundPasteInfoButton.bounds, of: backgroundPasteInfoButton, preferredEdge: .maxY)
