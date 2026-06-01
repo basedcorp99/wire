@@ -342,7 +342,7 @@ private enum BackgroundPaste {
         }
         guard let data = runCmuxProcess(
             executablePath: cliPath,
-            arguments: ["identify", "--no-caller"],
+            arguments: cmuxArguments(["identify", "--no-caller"]),
             operation: "identify"
         ) else {
             return nil
@@ -379,14 +379,14 @@ private enum BackgroundPaste {
 
         return runProcess(
             executablePath: target.cliPath,
-            arguments: [
+            arguments: cmuxArguments([
                 "send",
                 "--window", target.windowRef,
                 "--workspace", target.workspaceRef,
                 "--surface", target.surfaceRef,
                 "--",
                 text
-            ]
+            ])
         ) != nil
     }
 
@@ -397,6 +397,15 @@ private enum BackgroundPaste {
         ].compactMap { $0 }
 
         return candidateURLs.first { FileManager.default.isExecutableFile(atPath: $0.path) }?.path
+    }
+
+    private static func cmuxArguments(_ arguments: [String]) -> [String] {
+        let socketURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/cmux/cmux.sock")
+        guard FileManager.default.fileExists(atPath: socketURL.path) else {
+            return arguments
+        }
+        return ["--socket", socketURL.path] + arguments
     }
 
     private struct ProcessOutput {
