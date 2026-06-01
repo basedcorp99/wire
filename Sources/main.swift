@@ -3678,6 +3678,10 @@ final class CodexAPIClient: NSObject, WKNavigationDelegate, WKScriptMessageHandl
         do {
             return try await transcribePrepared(audioData: audioData)
         } catch {
+            if isAuthTokenFailure(error) {
+                try readAuthToken()
+                return try await transcribePrepared(audioData: audioData)
+            }
             guard isWebViewSessionFailure(error) else {
                 throw error
             }
@@ -3802,6 +3806,23 @@ final class CodexAPIClient: NSObject, WKNavigationDelegate, WKScriptMessageHandl
             || message.localizedCaseInsensitiveContains("could not connect to the server")
             || message.localizedCaseInsensitiveContains("the internet connection appears to be offline")
             || message.localizedCaseInsensitiveContains("network connection was lost")
+    }
+
+    private func isAuthTokenFailure(_ error: Error) -> Bool {
+        guard case AppError.transcriptionFailed(let message) = error else {
+            return false
+        }
+        let lowercasedMessage = message.lowercased()
+        return lowercasedMessage.contains("token_expired")
+            || lowercasedMessage.contains("token expired")
+            || lowercasedMessage.contains("authentication token is expired")
+            || ((message.contains("HTTP 400")
+                    || message.contains("HTTP 401")
+                    || message.contains("HTTP 403"))
+                && (lowercasedMessage.contains("token")
+                    || lowercasedMessage.contains("auth")
+                    || lowercasedMessage.contains("unauthorized")
+                    || lowercasedMessage.contains("forbidden")))
     }
 
     func cleanup() {
