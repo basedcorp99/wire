@@ -545,6 +545,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let computerCustomHarnessEnabledDefaultsKey = "computerCustomHarnessEnabled"
     private static let computerHarnessCommandDefaultsKey = "computerHarnessCommand"
     private static let defaultComputerHarnessCommand = "codex --yolo -c 'model_reasoning_effort=\"low\"' e {{prompt}}"
+    private static let cleanupEnabledDefaultsKey = "cleanupEnabled"
     private static let airPodsAutoStopSilenceSeconds: TimeInterval = 1.4
     private static let airPodsAutoStopMinimumSeconds: TimeInterval = 1.2
     private static let airPodsMinimumVoiceRMS: Float = 140
@@ -626,6 +627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.computerAutoDisablePhrase = UserDefaults.standard.string(forKey: Self.computerAutoDisablePhraseDefaultsKey) ?? ""
         state.computerCustomHarnessEnabled = UserDefaults.standard.bool(forKey: Self.computerCustomHarnessEnabledDefaultsKey)
         state.computerHarnessCommand = UserDefaults.standard.string(forKey: Self.computerHarnessCommandDefaultsKey) ?? Self.defaultComputerHarnessCommand
+        state.cleanupEnabled = (UserDefaults.standard.object(forKey: Self.cleanupEnabledDefaultsKey) as? Bool) ?? true
 
         // Initialize components
         codexClient = CodexAPIClient()
@@ -1511,11 +1513,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.transcriptionStage = .transcribing
             state.statusText = "Loading… uploading \(job.audioData.count / 1024) KB"
         }
-
         do {
-            let text = try await transcribe(job.audioData, retryASRFailure: job.retryASRFailure)
+            let rawText = try await transcribe(job.audioData, retryASRFailure: job.retryASRFailure)
 
-            state.lastTranscription = text
+            var finalText = rawText
+            if state.cleanupEnabled {
+                if !recorder.hasActiveRecording {
+                    state.statusText = "Cleaning up…"
+                }
+                do {
+                    finalText = try await codexClient.cleanup(text: rawText)
+                    Self.appendTranscriptionDebugLog("cleanup id=\(job.id) rawChars=\(rawText.count) cleanedChars=\(finalText.count)")
+                } catch {
+                    Self.appendTranscriptionDebugLog("cleanup-failed id=\(job.id) error=\(error.localizedDescription) falling back to raw")
+                    finalText = rawText
+                }
+            }
+
+            state.lastTranscription = finalText
             if let recoveryURL = job.recoveryURL {
                 try? FileManager.default.removeItem(at: recoveryURL)
             }
@@ -1527,12 +1542,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if job.wasStartedByAirPods {
                 airPodsSubmitEligible = true
             }
-            let copiedToClipboard = Clipboard.copy(text)
-            Self.appendTranscriptionDebugLog("done id=\(job.id) source=\(job.source) kind=\(String(describing: job.kind)) textChars=\(text.count) clipboard=\(copiedToClipboard) remaining=\(queuedTranscriptionJobs.count)")
+            let copiedToClipboard = Clipboard.copy(finalText)
+            Self.appendTranscriptionDebugLog("done id=\(job.id) source=\(job.source) kind=\(String(describing: job.kind)) textChars=\(finalText.count) clipboard=\(copiedToClipboard) remaining=\(queuedTranscriptionJobs.count)")
 
-            if !handleComputerTranscript(text) {
+            if !handleComputerTranscript(finalText) {
                 pasteTranscript(
-                    text,
+                    finalText,
                     target: job.pasteTarget,
                     pressReturnAfterPaste: job.shouldPressReturnAfterPaste
                 )
@@ -2132,6 +2147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.statusText = "Harness saved"
     }
 
+    func setCleanupEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.cleanupEnabledDefaultsKey)
+        state.cleanupEnabled = enabled
+        state.statusText = enabled ? "Cleanup enabled" : "Cleanup disabled"
+    }
+
     private func pressReturnKey() {
         let source = CGEventSource(stateID: .hidSystemState)
         let returnKey = CGKeyCode(kVK_Return)
@@ -2179,6 +2200,7 @@ final class AppState {
     var computerCustomHarnessEnabled = false { didSet { onChange?() } }
     var computerHarnessCommand = "" { didSet { onChange?() } }
     var computerCommandRunning = false { didSet { onChange?() } }
+    var cleanupEnabled = true { didSet { onChange?() } }
 
     private static func recoverableRecordingExistsOnDisk() -> Bool {
         if FileManager.default.fileExists(atPath: "/tmp/wire-recoverable-recording.wav") {
@@ -3825,6 +3847,141 @@ final class CodexAPIClient: NSObject, WKNavigationDelegate, WKScriptMessageHandl
                     || lowercasedMessage.contains("forbidden")))
     }
 
+
+    private static let cleanupInstructions = """
+        Clean up dictation transcripts. Fix likely speech recognition mistakes, punctuation, capitalization, \
+        and formatting. Remove filler words and disfluencies when they do not add meaning. When the user \
+        clearly self-corrects or backtracks, keep the corrected intent. Preserve the user's meaning, wording, \
+        and flow unless a small cleanup makes the transcript more coherent. Do not answer the user or add \
+        new content. Return only the cleaned transcript.
+        """
+
+    func cleanup(text: String) async throws -> String {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return text
+        }
+        if !isReady || webView == nil {
+            try await prepare()
+        }
+        guard let webView = webView else {
+            throw AppError.sessionNotReady
+        }
+
+        let rawText = text
+        let token = authToken
+        let account = accountID
+        let instructions = Self.cleanupInstructions
+
+        let functionBody = """
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 60000);
+        try {
+            const response = await fetch('https://chatgpt.com/backend-api/codex/responses', {
+                method: 'POST',
+                headers: {
+                    'Authorization': 'Bearer ' + authToken,
+                    'ChatGPT-Account-Id': accountID,
+                    'Content-Type': 'application/json',
+                    'originator': 'codex_desktop'
+                },
+                body: JSON.stringify({
+                    model: 'gpt-5.5',
+                    input: [{ role: 'user', content: rawText }],
+                    instructions: instructions,
+                    store: false,
+                    stream: true
+                }),
+                signal: controller.signal
+            });
+            clearTimeout(timeout);
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                return JSON.stringify({ success: false, error: 'HTTP ' + response.status + ': ' + errorText.substring(0, 500) });
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let finalText = '';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\\n');
+                buffer = lines.pop();
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    const data = line.slice(6);
+                    if (data === '[DONE]') continue;
+                    try {
+                        const event = JSON.parse(data);
+                        if (event.type === 'response.output_text.done') {
+                            finalText = event.text || '';
+                        }
+                    } catch (e) {}
+                }
+            }
+            if (finalText) {
+                return JSON.stringify({ success: true, text: finalText });
+            }
+            return JSON.stringify({ success: false, error: 'No output text in response' });
+        } catch (e) {
+            clearTimeout(timeout);
+            return JSON.stringify({ success: false, error: e && e.name === 'AbortError' ? 'Cleanup request timed out' : (e.message || String(e)) });
+        }
+        """
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var didResume = false
+            func finish(_ result: Result<String, Error>) {
+                guard !didResume else { return }
+                didResume = true
+                switch result {
+                case .success(let text):
+                    continuation.resume(returning: text)
+                case .failure(let error):
+                    continuation.resume(throwing: error)
+                }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 70) {
+                finish(.failure(AppError.transcriptionFailed("Timed out waiting for cleanup response")))
+            }
+
+            webView.callAsyncJavaScript(
+                functionBody,
+                arguments: [
+                    "rawText": rawText,
+                    "authToken": token,
+                    "accountID": account,
+                    "instructions": instructions
+                ],
+                in: nil,
+                in: .page
+            ) { result in
+                switch result {
+                case .success(let value):
+                    guard let jsonString = value as? String,
+                          let jsonData = jsonString.data(using: .utf8),
+                          let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+                        finish(.failure(AppError.transcriptionFailed("Invalid JavaScript result from cleanup")))
+                        return
+                    }
+                    if let success = json["success"] as? Bool, success,
+                       let text = json["text"] as? String {
+                        finish(.success(text))
+                    } else {
+                        let errorMsg = json["error"] as? String ?? "Unknown error"
+                        finish(.failure(AppError.transcriptionFailed(errorMsg)))
+                    }
+                case .failure(let error):
+                    finish(.failure(AppError.transcriptionFailed(error.localizedDescription)))
+                }
+            }
+        }
+    }
+
     func cleanup() {
         cleanupWebView()
         prepareTask?.cancel()
@@ -3938,6 +4095,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private let headsetModePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let headsetControlsSwitch = NSSwitch()
     private let sendEnterAfterPasteSwitch = NSSwitch()
+    private let cleanupSwitch = NSSwitch()
     private let airPodsControlSwitch = NSSwitch()
     private let airPodsInfoButton = NSButton(title: "", target: nil, action: nil)
     private let computerControlsSwitch = NSSwitch()
@@ -4162,6 +4320,10 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         let headsetBottomSpacer = spacer(height: 5)
         rootStack.addArrangedSubview(headsetBottomSpacer)
         headsetSettingsRows = [wiredButtonRow, airPodsControlRow, sendEnterRow, headsetBottomSpacer]
+
+        configureSwitch(cleanupSwitch, action: #selector(toggleCleanup))
+        let cleanupRow = menuRow(symbol: "text.badge.checkmark", title: "Clean up transcript", trailing: cleanupSwitch)
+        rootStack.addArrangedSubview(cleanupRow)
 
         rootStack.addArrangedSubview(divider())
         rootStack.addArrangedSubview(sectionLabel("Computer"))
@@ -4425,6 +4587,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             self.headsetModePopup.selectItem(at: self.headsetProbeManager.currentMode.rawValue)
             self.airPodsControlSwitch.state = self.headsetProbeManager.isAirPodsControlEnabled ? .on : .off
             self.sendEnterAfterPasteSwitch.state = self.state.sendEnterAfterPaste ? .on : .off
+            self.cleanupSwitch.state = self.state.cleanupEnabled ? .on : .off
             self.computerControlsSwitch.state = self.state.computerControlsEnabled ? .on : .off
             self.computerCustomHarnessSwitch.state = self.state.computerCustomHarnessEnabled ? .on : .off
             self.computerAutoEnableSwitch.state = self.state.computerAutoEnableEnabled ? .on : .off
@@ -4572,6 +4735,11 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
 
     @objc private func toggleSendEnterAfterPaste() {
         (NSApp.delegate as? AppDelegate)?.setSendEnterAfterPaste(sendEnterAfterPasteSwitch.state == .on)
+        refresh()
+    }
+
+    @objc private func toggleCleanup() {
+        (NSApp.delegate as? AppDelegate)?.setCleanupEnabled(cleanupSwitch.state == .on)
         refresh()
     }
 
