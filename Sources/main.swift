@@ -443,6 +443,22 @@ private enum BackgroundPaste {
                 }
                 log("cmux-\(operation) failed attempt=\(attempt) mode=shell exit=\(shellResult.exitCode) stderr=\(shellResult.stderr)")
             }
+            if let launchctlResult = runProcess(
+                executablePath: "/bin/launchctl",
+                arguments: [
+                    "asuser",
+                    "\(getuid())",
+                    "/bin/zsh",
+                    "-lc",
+                    shellCommand(executablePath: executablePath, arguments: arguments)
+                ]
+            ) {
+                if launchctlResult.exitCode == 0 {
+                    log("cmux-\(operation) recovered attempt=\(attempt) mode=launchctl")
+                    return launchctlResult.stdout
+                }
+                log("cmux-\(operation) failed attempt=\(attempt) mode=launchctl exit=\(launchctlResult.exitCode) stderr=\(launchctlResult.stderr)")
+            }
             Thread.sleep(forTimeInterval: 0.06)
         }
 
