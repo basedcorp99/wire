@@ -149,6 +149,7 @@ private struct CmuxPasteTarget {
 private enum BackgroundPasteResult {
     case inserted(String)
     case failed(String)
+    case failedWithoutFallback(String)
 }
 
 private enum BackgroundPaste {
@@ -206,8 +207,15 @@ private enum BackgroundPaste {
             return .failed("target-element-missing")
         }
 
-        if let cmuxTarget = target.cmuxTarget,
-           sendToCmux(text, target: cmuxTarget) {
+        if target.bundleIdentifier == "com.cmuxterm.app" {
+            guard let cmuxTarget = target.cmuxTarget else {
+                return .failedWithoutFallback("cmux-target-unavailable")
+            }
+
+            guard sendToCmux(text, target: cmuxTarget) else {
+                return .failedWithoutFallback("cmux-send-failed")
+            }
+
             return .inserted("cmux-send")
         }
 
@@ -1875,6 +1883,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         target: BackgroundPasteTarget?,
         pressReturnAfterPaste: Bool
     ) -> String {
+        if let target,
+           target.bundleIdentifier == "com.cmuxterm.app",
+           NSWorkspace.shared.frontmostApplication?.bundleIdentifier == target.bundleIdentifier {
+            Self.appendTranscriptionDebugLog("background-paste skipped reason=cmux-frontmost target=\(target.summary)")
+            typeText(text, pressReturnAfterPaste: pressReturnAfterPaste)
+            state.statusText = "Pasted to CMUX"
+            showMenuBarFeedback("Pasted")
+            return "cmux-foreground"
+        }
+
         if let target {
             switch BackgroundPaste.insert(text, into: target) {
             case .inserted(let method):
@@ -1887,6 +1905,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return "background:\(method)"
             case .failed(let reason):
                 Self.appendTranscriptionDebugLog("background-paste failed reason=\(reason) target=\(target.summary)")
+            case .failedWithoutFallback(let reason):
+                Self.appendTranscriptionDebugLog("background-paste failed-no-fallback reason=\(reason) target=\(target.summary)")
+                state.statusText = target.bundleIdentifier == "com.cmuxterm.app"
+                    ? "Copied, CMUX paste failed"
+                    : "Copied, background paste failed"
+                showMenuBarFeedback("Copied")
+                return "background-failed:\(reason)"
             }
         } else {
             Self.appendTranscriptionDebugLog("background-paste skipped reason=no-target")
@@ -4275,6 +4300,10 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         toggleShortcutButton.target = self
         toggleShortcutButton.action = #selector(captureToggleShortcut)
         rootStack.addArrangedSubview(menuRow(symbol: "keyboard", title: "Toggle shortcut", trailing: toggleShortcutButton))
+
+        configureSwitch(cleanupSwitch, action: #selector(toggleCleanup))
+        let cleanupRow = menuRow(symbol: "text.badge.checkmark", title: "Clean up transcript", trailing: cleanupSwitch)
+        rootStack.addArrangedSubview(cleanupRow)
         rootStack.addArrangedSubview(spacer(height: 8))
 
         rootStack.addArrangedSubview(divider())
@@ -4314,10 +4343,6 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         let headsetBottomSpacer = spacer(height: 5)
         rootStack.addArrangedSubview(headsetBottomSpacer)
         headsetSettingsRows = [wiredButtonRow, airPodsControlRow, sendEnterRow, headsetBottomSpacer]
-
-        configureSwitch(cleanupSwitch, action: #selector(toggleCleanup))
-        let cleanupRow = menuRow(symbol: "text.badge.checkmark", title: "Clean up transcript", trailing: cleanupSwitch)
-        rootStack.addArrangedSubview(cleanupRow)
 
         rootStack.addArrangedSubview(divider())
         rootStack.addArrangedSubview(sectionLabel("Computer"))
