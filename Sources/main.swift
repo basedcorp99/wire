@@ -208,7 +208,7 @@ private enum BackgroundPaste {
         }
 
         if target.bundleIdentifier == "com.cmuxterm.app" {
-            return insertIntoCmuxTextArea(text, target: target)
+            return pasteIntoCmuxProcess(text, target: target)
         }
 
         guard let initialValue = stringAttribute(kAXValueAttribute as CFString, from: target.element) else {
@@ -289,24 +289,31 @@ private enum BackgroundPaste {
         return .inserted("value")
     }
 
-    private static func insertIntoCmuxTextArea(_ text: String, target: BackgroundPasteTarget) -> BackgroundPasteResult {
-        guard let range = target.selectedTextRange else {
-            return .failedWithoutFallback("cmux-target-has-no-selected-text-range")
+    private static func pasteIntoCmuxProcess(_ text: String, target: BackgroundPasteTarget) -> BackgroundPasteResult {
+        guard Clipboard.copy(text) else {
+            return .failedWithoutFallback("cmux-clipboard-copy-failed")
         }
 
-        let restoreSelectionStatus = setSelectedTextRange(range, on: target.element)
-        let selectedTextStatus = AXUIElementSetAttributeValue(
-            target.element,
-            kAXSelectedTextAttribute as CFString,
-            text as CFTypeRef
-        )
-        guard selectedTextStatus == .success else {
-            return .failedWithoutFallback("cmux-selectedText=\(selectedTextStatus.wireDescription) restoreSelection=\(restoreSelectionStatus.wireDescription)")
+        let source = CGEventSource(stateID: .hidSystemState)
+        let commandDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_Command), keyDown: true)
+        let vDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true)
+        let vUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false)
+        let commandUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_Command), keyDown: false)
+
+        guard let commandDown, let vDown, let vUp, let commandUp else {
+            return .failedWithoutFallback("cmux-key-event-create-failed")
         }
 
-        let insertionLocation = range.location + (text as NSString).length
-        _ = setSelectedTextRange(CFRange(location: insertionLocation, length: 0), on: target.element)
-        return .inserted("cmux-selected-text")
+        commandDown.flags = .maskCommand
+        vDown.flags = .maskCommand
+        vUp.flags = .maskCommand
+        commandUp.flags = []
+
+        commandDown.postToPid(target.pid)
+        vDown.postToPid(target.pid)
+        vUp.postToPid(target.pid)
+        commandUp.postToPid(target.pid)
+        return .inserted("cmux-pid-paste")
     }
 
     private static func focusedElement() -> AXUIElement? {
