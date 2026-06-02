@@ -234,14 +234,14 @@ private enum BackgroundPaste {
         }
 
         if target.bundleIdentifier == "com.cmuxterm.app" {
-            if let cmuxTarget = target.cmuxTarget {
-                if let failureReason = sendToCmux(text, target: cmuxTarget) {
-                    log("cmux-send failed reason=\(failureReason)")
-                } else {
-                    return .inserted("cmux-send")
-                }
+            guard let cmuxTarget = target.cmuxTarget else {
+                return .failedWithoutFallback("cmux-target-unresolved")
             }
-            return pasteIntoCmuxProcess(text, target: target)
+            if let failureReason = sendToCmux(text, target: cmuxTarget) {
+                log("cmux-send failed reason=\(failureReason)")
+                return .failedWithoutFallback(failureReason)
+            }
+            return .inserted("cmux-send")
         }
 
         guard let initialValue = stringAttribute(kAXValueAttribute as CFString, from: target.element) else {
@@ -393,7 +393,7 @@ private enum BackgroundPaste {
         }
         guard let data = runCmuxProcess(
             executablePath: cliPath,
-            arguments: cmuxArguments(["identify", "--no-caller"]),
+            arguments: ["identify", "--no-caller"],
             operation: "identify"
         ) else {
             return nil
@@ -426,14 +426,14 @@ private enum BackgroundPaste {
     private static func sendToCmux(_ text: String, target: CmuxPasteTarget) -> String? {
         guard runCmuxProcess(
             executablePath: target.cliPath,
-            arguments: cmuxArguments([
+            arguments: [
                 "send",
                 "--window", target.windowRef,
                 "--workspace", target.workspaceRef,
                 "--surface", target.surfaceRef,
                 "--",
                 cmuxEscapedText(text)
-            ]),
+            ],
             operation: "send"
         ) != nil else {
             return "cmux-send-failed"
@@ -459,14 +459,6 @@ private enum BackgroundPaste {
         return candidateURLs.first { FileManager.default.isExecutableFile(atPath: $0.path) }?.path
     }
 
-    private static func cmuxArguments(_ arguments: [String]) -> [String] {
-        let socketURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/cmux/cmux.sock")
-        guard FileManager.default.fileExists(atPath: socketURL.path) else {
-            return arguments
-        }
-        return ["--socket", socketURL.path] + arguments
-    }
 
     private struct ProcessOutput {
         let stdout: Data
@@ -768,8 +760,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var activeRecordingStartedByHeadsetHold = false
     private var activeRecordingSource = ""
     private var activeRecordingPasteTarget: BackgroundPasteTarget?
-    private var activeRecordingPasteTargetResolutionTask: Task<BackgroundPasteTarget?, Never>?
-    private var activeRecordingPasteTargetGeneration = 0
     private var airPodsMuteStateObserver: NSObjectProtocol?
     private var lastAirPodsMuteToggleAt: Date?
     private var airPodsLastVoiceAt: Date?
@@ -1653,7 +1643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         startedByHeadsetHold: Bool = false,
         source: String
     ) {
-        let pasteTarget = state.backgroundPasteEnabled ? BackgroundPaste.captureIfTrusted(resolveCmuxTarget: false) : nil
+        let pasteTarget = state.backgroundPasteEnabled ? BackgroundPaste.captureIfTrusted() : nil
 
         if kind == .hold {
             holdRecordingStartPending = true
@@ -1699,7 +1689,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 activeRecordingStartedByHeadsetHold = startedByHeadsetHold
                 activeRecordingSource = source
                 activeRecordingPasteTarget = pasteTarget
-                startPasteTargetResolutionIfNeeded(for: pasteTarget)
                 airPodsLastVoiceAt = startedByAirPods ? Date() : nil
                 airPodsPeakRMS = 0
                 airPodsLastLevelLogAt = nil
@@ -1719,8 +1708,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } catch {
                 clearPendingHoldStartIfNeeded(kind: kind)
                 activeRecordingPasteTarget = nil
-                activeRecordingPasteTargetResolutionTask?.cancel()
-                activeRecordingPasteTargetResolutionTask = nil
                 state.statusText = "Could not start recording: \(error.localizedDescription)"
                 Self.appendTranscriptionDebugLog("start failed source=\(source) kind=\(kind) error=\(error.localizedDescription)")
                 if hasPendingTranscriptions {
@@ -1733,74 +1720,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    @MainActor
-    private func startPasteTargetResolutionIfNeeded(for pasteTarget: BackgroundPasteTarget?) {
-        activeRecordingPasteTargetResolutionTask?.cancel()
-        activeRecordingPasteTargetResolutionTask = nil
-        activeRecordingPasteTargetGeneration &+= 1
-
-        guard let pasteTarget, pasteTarget.needsCmuxResolution else {
-            return
-        }
-
-        let generation = activeRecordingPasteTargetGeneration
-        let startedAt = Date()
-        let task = Task.detached(priority: .userInitiated) {
-            BackgroundPaste.resolveCmuxTarget(for: pasteTarget)
-        }
-        activeRecordingPasteTargetResolutionTask = task
-
-        Task { @MainActor [weak self, task] in
-            guard let self, let resolved = await task.value else { return }
-            guard self.activeRecordingPasteTargetGeneration == generation,
-                  self.activeRecordingPasteTarget?.pid == pasteTarget.pid else {
-                return
-            }
-            self.activeRecordingPasteTarget = resolved
-            let elapsed = Date().timeIntervalSince(startedAt)
-            if resolved.cmuxTarget != nil {
-                Self.appendTranscriptionDebugLog("cmux-identify resolved elapsed=\(String(format: "%.3f", elapsed))")
-            } else {
-                Self.appendTranscriptionDebugLog("cmux-identify unavailable elapsed=\(String(format: "%.3f", elapsed))")
-            }
-        }
-    }
-
-    @MainActor
-    private func resolvedActiveRecordingPasteTarget() async -> BackgroundPasteTarget? {
-        guard let target = activeRecordingPasteTarget,
-              target.needsCmuxResolution,
-              let task = activeRecordingPasteTargetResolutionTask else {
-            return activeRecordingPasteTarget
-        }
-
-        guard let resolved = await waitForPasteTargetResolution(task, timeout: 0.15) else {
-            return activeRecordingPasteTarget ?? target
-        }
-        return resolved
-    }
-
-    @MainActor
-    private func waitForPasteTargetResolution(
-        _ task: Task<BackgroundPasteTarget?, Never>,
-        timeout: TimeInterval
-    ) async -> BackgroundPasteTarget? {
-        await withCheckedContinuation { continuation in
-            var didResume = false
-            func resume(_ value: BackgroundPasteTarget?) {
-                guard !didResume else { return }
-                didResume = true
-                continuation.resume(returning: value)
-            }
-
-            Task { @MainActor in
-                resume(await task.value)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
-                resume(nil)
-            }
-        }
-    }
 
     private func clearPendingHoldStartIfNeeded(kind: HotKeyKind) {
         guard kind == .hold else { return }
@@ -1821,7 +1740,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let wasStartedByHeadsetHold = activeRecordingStartedByHeadsetHold
             let stoppedRecordingKind = activeRecordingKind
             let stoppedRecordingSource = activeRecordingSource
-            let pasteTarget = await resolvedActiveRecordingPasteTarget()
+            let pasteTarget = activeRecordingPasteTarget
             stopRecordingStatusTimer()
             activeRecordingKind = nil
             activeRecordingShouldPressReturn = false
@@ -1829,8 +1748,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             activeRecordingStartedByHeadsetHold = false
             activeRecordingSource = ""
             activeRecordingPasteTarget = nil
-            activeRecordingPasteTargetResolutionTask?.cancel()
-            activeRecordingPasteTargetResolutionTask = nil
             airPodsLastVoiceAt = nil
             airPodsPeakRMS = 0
             airPodsLastLevelLogAt = nil
