@@ -15,6 +15,7 @@ import ServiceManagement
 struct WireApp {
     static func main() {
         let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
         let delegate = AppDelegate()
         app.delegate = delegate
         app.run()
@@ -681,7 +682,7 @@ private extension AXError {
 
 // MARK: - App Delegate
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private static let sendEnterAfterPasteDefaultsKey = "sendEnterAfterPaste"
     private static let headsetControlsEnabledDefaultsKey = "headsetControlsEnabled"
     private static let computerControlsEnabledDefaultsKey = "computerControlsEnabled"
@@ -714,15 +715,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let state = AppState()
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
+    private weak var menuBarPopoverController: MenuBarPopoverViewController?
+    private var settingsWindow: NSWindow?
+    private weak var settingsController: SettingsViewController?
+    private var statusSpinnerTimer: Timer?
+    private var menuBarFeedbackClearWorkItem: DispatchWorkItem?
+    private var menuBarFeedbackTitle: String?
+    private var popoverOutsideClickMonitors: [Any] = []
+    private var statusSpinnerIndex = 0
+    private let statusSpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     private var hotKeyManager: HotKeyManager!
     private var headsetProbeManager: HeadsetProbeManager!
     private var codexClient: CodexAPIClient!
     private var recorder: AudioRecorder!
-    private var statusSpinnerTimer: Timer?
     private var recordingStatusTimer: Timer?
-    private var menuBarFeedbackClearWorkItem: DispatchWorkItem?
-    private var menuBarFeedbackTitle: String?
-    private var popoverOutsideClickMonitors: [Any] = []
     private var recordingStartedAt: Date?
     private var activeRecordingShouldPressReturn = false
     private var activeRecordingStartedByAirPods = false
@@ -736,7 +742,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var airPodsPeakRMS: Float = 0
     private var airPodsLastLevelLogAt: Date?
     private var airPodsAutoStopArmed = false
-    private var statusSpinnerIndex = 0
     private var activeRecordingKind: HotKeyKind?
     private var holdRecordingStartPending = false
     private var stopHoldWhenRecordingStarts = false
@@ -746,7 +751,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var nextTranscriptionJobID = 1
     private var selfTestTranscript: String?
     private var selfTestTranscribeByteCounts: [Int] = []
-    private let statusSpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     private var pendingTranscriptionCount: Int {
         queuedTranscriptionJobs.count + (activeTranscriptionJob == nil ? 0 : 1)
@@ -801,7 +805,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onHoldReleased: { [weak self] in self?.handleHoldHotKeyReleased() }
         )
 
-        // Setup menu bar: icon only
+        installMainMenu()
+
+        // Menu bar icon
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "wire") {
             image.isTemplate = true
@@ -813,20 +819,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
 
-        // Setup popover
-        let controller = PopoverViewController(
-            state: state,
-            hotKeyManager: hotKeyManager,
-            headsetProbeManager: headsetProbeManager
-        )
-        _ = controller.view
+        let menuController = MenuBarPopoverViewController(state: state)
+        menuController.onOpenSettings = { [weak self] in self?.openSettings() }
+        menuBarPopoverController = menuController
+        _ = menuController.view
+
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentViewController = controller
+        popover.contentViewController = menuController
 
-        state.onChange = { [weak self, weak controller] in
+        state.onChange = { [weak self, weak menuController] in
             self?.renderStatusItem()
-            controller?.refresh()
+            menuController?.refresh()
+            self?.settingsController?.refresh()
         }
         refreshRecoverableRecordingState()
         hotKeyManager.registerSavedShortcuts()
@@ -847,6 +852,158 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runHeadsetPathSelfTestIfRequested()
         runDefaultCaptureSelfTestIfRequested()
         runBackgroundPasteSelfTestIfRequested()
+        runUISelfTestIfRequested()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        return false
+    }
+
+    private func installMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        let quitItem = NSMenuItem(title: "Quit wire", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quitItem.target = NSApp
+        appMenu.addItem(quitItem)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let windowMenuItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        let closeItem = NSMenuItem(title: "Close", action: #selector(closeKeyWindow), keyEquivalent: "w")
+        closeItem.target = self
+        windowMenu.addItem(closeItem)
+        windowMenuItem.submenu = windowMenu
+        mainMenu.addItem(windowMenuItem)
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    @objc private func closeKeyWindow() {
+        if let keyWindow = NSApp.keyWindow {
+            keyWindow.performClose(nil)
+        } else {
+            settingsWindow?.performClose(nil)
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let closedWindow = notification.object as? NSWindow,
+              closedWindow === settingsWindow else { return }
+        settingsWindow = nil
+        settingsController = nil
+        if !popover.isShown {
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+
+
+    private func runUISelfTestIfRequested() {
+        guard ProcessInfo.processInfo.environment["WIRE_UI_SELF_TEST"] == "1" else {
+            return
+        }
+
+        let outputDirectory = URL(fileURLWithPath: ProcessInfo.processInfo.environment["WIRE_UI_SELF_TEST_DIR"] ?? "/tmp/wire-ui-self-test")
+        try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+
+        state.lastTranscription = "Sample transcription for layout verification."
+        state.statusText = "Ready for dictation"
+        menuBarPopoverController?.refresh()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self else { return }
+
+            if let popoverController = self.menuBarPopoverController {
+                popoverController.refresh()
+                let popoverView = popoverController.view
+                popoverView.layoutSubtreeIfNeeded()
+                self.writePNG(from: popoverView, to: outputDirectory.appendingPathComponent("popover.png"))
+            }
+
+            self.openSettings()
+            self.settingsController?.refresh()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                guard let self else { return }
+                if let settingsWindow = self.settingsWindow, let contentView = self.settingsController?.view {
+                    settingsWindow.setFrameOrigin(NSPoint(x: 120, y: 120))
+                    settingsWindow.displayIfNeeded()
+                    contentView.layoutSubtreeIfNeeded()
+                    self.writePNG(from: contentView, to: outputDirectory.appendingPathComponent("settings-general.png"))
+                }
+
+                let report = self.makeUISelfTestReport()
+                let reportURL = outputDirectory.appendingPathComponent("report.txt")
+                try? report.write(to: reportURL, atomically: true, encoding: .utf8)
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+    }
+
+    private func writePNG(from view: NSView, to url: URL) {
+        view.layoutSubtreeIfNeeded()
+        let bounds = view.bounds
+        guard bounds.width > 1, bounds.height > 1,
+              let rep = view.bitmapImageRepForCachingDisplay(in: bounds) else {
+            return
+        }
+        view.cacheDisplay(in: bounds, to: rep)
+        guard let data = rep.representation(using: .png, properties: [:]) else {
+            return
+        }
+        try? data.write(to: url)
+    }
+
+    private func writePNG(from window: NSWindow, to url: URL) {
+        window.displayIfNeeded()
+        window.contentView?.layoutSubtreeIfNeeded()
+        guard let cgImage = CGWindowListCreateImage(
+            .null,
+            .optionIncludingWindow,
+            CGWindowID(window.windowNumber),
+            [.boundsIgnoreFraming, .bestResolution]
+        ) else {
+            if let contentView = window.contentView {
+                writePNG(from: contentView, to: url)
+            }
+            return
+        }
+        let rep = NSBitmapImageRep(cgImage: cgImage)
+        guard let data = rep.representation(using: .png, properties: [:]) else {
+            return
+        }
+        try? data.write(to: url)
+    }
+
+    private func makeUISelfTestReport() -> String {
+        var lines: [String] = []
+        lines.append("wire UI self-test report")
+
+        if let popoverView = menuBarPopoverController?.view {
+            lines.append("popoverSize=\(Int(popoverView.bounds.width))x\(Int(popoverView.bounds.height))")
+        }
+
+        if let settingsWindow {
+            lines.append("settingsWindowSize=\(Int(settingsWindow.frame.width))x\(Int(settingsWindow.frame.height))")
+            lines.append("settingsTitle=\(settingsWindow.title)")
+        }
+
+        if let settingsView = settingsController?.view {
+            lines.append("settingsViewSize=\(Int(settingsView.bounds.width))x\(Int(settingsView.bounds.height))")
+        }
+
+        settingsController?.collectUISelfTestMetrics(into: &lines)
+        if let settingsWindow {
+            lines.append("windowFrame=\(settingsWindow.frame)")
+        }
+        if let contentView = settingsController?.view {
+            lines.append("settingsRootFrame=\(contentView.frame)")
+        }
+        return lines.joined(separator: "\n") + "\n"
     }
 
     private func runBackgroundPasteSelfTestIfRequested() {
@@ -1099,6 +1256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
@@ -1116,6 +1274,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func closePopover() {
         popover.performClose(nil)
         removePopoverOutsideClickMonitor()
+    }
+
+    @objc func openSettings() {
+        closePopover()
+        if settingsWindow == nil {
+            let controller = SettingsViewController(
+                state: state,
+                hotKeyManager: hotKeyManager,
+                headsetProbeManager: headsetProbeManager
+            )
+            settingsController = controller
+            _ = controller.view
+
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 560, height: 380),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "Settings"
+            window.contentViewController = controller
+            window.minSize = NSSize(width: 500, height: 320)
+            window.backgroundColor = .windowBackgroundColor
+            window.toolbar = controller.makeToolbar()
+            window.toolbarStyle = .preference
+            window.titleVisibility = .hidden
+            window.isReleasedWhenClosed = false
+            window.center()
+            window.delegate = self
+            settingsWindow = window
+            controller.resizeWindowForSelectedPane()
+        }
+        NSApp.setActivationPolicy(.regular)
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        settingsController?.refresh()
     }
 
     private func installPopoverOutsideClickMonitor() {
@@ -4193,7 +4387,441 @@ enum AppError: LocalizedError {
     }
 }
 
-// MARK: - Popover View Controller
+
+// MARK: - Menu Bar Popover
+
+final class MenuBarPopoverViewController: NSViewController {
+    private enum Layout {
+        static let width: CGFloat = 286
+    }
+
+    private let state: AppState
+    private let statusLabel = NSTextField(labelWithString: "")
+    private let transcriptLabel = NSTextField(labelWithString: "No recent transcription")
+    private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
+    private let retryLastButton = NSButton(title: "", target: nil, action: nil)
+    private let loadingIndicator = NSProgressIndicator()
+    private let openSettingsButton = NSButton(title: "Open Settings…", target: nil, action: nil)
+    private let quitButton = HoverMenuButton(title: "", target: nil, action: nil)
+
+    var onOpenSettings: (() -> Void)?
+
+    init(state: AppState) {
+        self.state = state
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: Layout.width, height: 0))
+        visual.material = .popover
+        visual.blendingMode = .behindWindow
+        visual.state = .active
+        view = visual
+        buildUI()
+        refresh()
+    }
+
+    private func buildUI() {
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.spacing = 0
+        root.edgeInsets = NSEdgeInsets(top: 6, left: 0, bottom: 6, right: 0)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            root.topAnchor.constraint(equalTo: view.topAnchor),
+            root.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 10
+        header.edgeInsets = NSEdgeInsets(top: 7, left: 14, bottom: 9, right: 14)
+
+        let mic = NSImageView(image: NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil) ?? NSImage())
+        mic.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
+        mic.contentTintColor = .controlAccentColor
+        mic.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        mic.heightAnchor.constraint(equalToConstant: 14).isActive = true
+
+        let title = NSTextField(labelWithString: "wire")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+
+        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.lineBreakMode = .byTruncatingTail
+
+        let titleStack = NSStackView()
+        titleStack.orientation = .vertical
+        titleStack.spacing = 2
+        let titleRow = NSStackView(views: [mic, title])
+        titleRow.orientation = .horizontal
+        titleRow.spacing = 5
+        titleStack.addArrangedSubview(titleRow)
+        titleStack.addArrangedSubview(statusLabel)
+
+        loadingIndicator.style = .spinning
+        loadingIndicator.controlSize = .small
+        loadingIndicator.isIndeterminate = true
+        loadingIndicator.isDisplayedWhenStopped = false
+        loadingIndicator.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        loadingIndicator.heightAnchor.constraint(equalToConstant: 16).isActive = true
+
+        header.addArrangedSubview(titleStack)
+        header.addArrangedSubview(loadingIndicator)
+        root.addArrangedSubview(header)
+        root.addArrangedSubview(WireUI.divider())
+
+        root.addArrangedSubview(WireUI.popoverSectionLabel("Latest"))
+
+        transcriptLabel.font = .systemFont(ofSize: 12)
+        transcriptLabel.textColor = .secondaryLabelColor
+        transcriptLabel.lineBreakMode = .byWordWrapping
+        transcriptLabel.maximumNumberOfLines = 4
+        transcriptLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        transcriptLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        configureIconButton(copyLatestButton, symbol: "doc.on.doc", tip: "Copy latest transcription", action: #selector(copyLatest))
+        configureIconButton(retryLastButton, symbol: "arrow.clockwise", tip: "Retry saved recording", action: #selector(retryLastRecording))
+
+        let latestRow = NSStackView()
+        latestRow.orientation = .horizontal
+        latestRow.alignment = .top
+        latestRow.spacing = 8
+        latestRow.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 10, right: 14)
+        latestRow.addArrangedSubview(transcriptLabel)
+        latestRow.addArrangedSubview(retryLastButton)
+        latestRow.addArrangedSubview(copyLatestButton)
+        root.addArrangedSubview(latestRow)
+
+        root.addArrangedSubview(WireUI.divider())
+
+        openSettingsButton.bezelStyle = .recessed
+        openSettingsButton.controlSize = .regular
+        openSettingsButton.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        openSettingsButton.target = self
+        openSettingsButton.action = #selector(openSettingsPressed)
+
+        let settingsRow = NSStackView(views: [openSettingsButton])
+        settingsRow.orientation = .horizontal
+        settingsRow.alignment = .centerY
+        settingsRow.distribution = .fill
+        settingsRow.edgeInsets = NSEdgeInsets(top: 9, left: 14, bottom: 5, right: 14)
+        root.addArrangedSubview(settingsRow)
+
+        quitButton.bezelStyle = .inline
+        quitButton.isBordered = false
+        quitButton.target = self
+        quitButton.action = #selector(quitWire)
+        quitButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let quitContent = NSStackView()
+        quitContent.orientation = .horizontal
+        quitContent.alignment = .centerY
+        quitContent.spacing = 7
+        quitContent.translatesAutoresizingMaskIntoConstraints = false
+        let quitIcon = NSImageView(image: NSImage(systemSymbolName: "power", accessibilityDescription: nil) ?? NSImage())
+        quitIcon.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+        quitIcon.contentTintColor = .systemRed
+        quitIcon.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        let quitLabel = NSTextField(labelWithString: "Quit")
+        quitLabel.font = .systemFont(ofSize: 12)
+        quitLabel.textColor = .systemRed
+        quitContent.addArrangedSubview(quitIcon)
+        quitContent.addArrangedSubview(quitLabel)
+        quitButton.addSubview(quitContent)
+
+        let quitRow = NSView()
+        quitRow.translatesAutoresizingMaskIntoConstraints = false
+        quitRow.addSubview(quitButton)
+        NSLayoutConstraint.activate([
+            quitRow.heightAnchor.constraint(equalToConstant: 36),
+            quitButton.centerXAnchor.constraint(equalTo: quitRow.centerXAnchor),
+            quitButton.centerYAnchor.constraint(equalTo: quitRow.centerYAnchor),
+            quitButton.widthAnchor.constraint(equalToConstant: 88),
+            quitButton.heightAnchor.constraint(equalToConstant: 28),
+            quitContent.centerXAnchor.constraint(equalTo: quitButton.centerXAnchor),
+            quitContent.centerYAnchor.constraint(equalTo: quitButton.centerYAnchor)
+        ])
+        root.addArrangedSubview(quitRow)
+    }
+
+    private func configureIconButton(_ button: NSButton, symbol: String, tip: String, action: Selector) {
+        button.target = self
+        button.action = action
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.toolTip = tip
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip) {
+            image.isTemplate = true
+            button.image = image
+        }
+        button.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 24).isActive = true
+    }
+
+    func refresh() {
+        guard isViewLoaded else { return }
+        statusLabel.stringValue = state.statusText.isEmpty ? "Ready" : state.statusText
+
+        switch state.transcriptionStage {
+        case .transcribing:
+            loadingIndicator.startAnimation(nil)
+        default:
+            if state.computerCommandRunning {
+                loadingIndicator.startAnimation(nil)
+            } else {
+                loadingIndicator.stopAnimation(nil)
+            }
+        }
+
+        if state.computerCommandRunning {
+            transcriptLabel.stringValue = "Running command…"
+        } else if state.transcriptionStage == .transcribing {
+            transcriptLabel.stringValue = "Transcribing…"
+        } else if state.lastTranscription.isEmpty {
+            transcriptLabel.stringValue = "No recent transcription"
+        } else {
+            transcriptLabel.stringValue = state.lastTranscription
+        }
+
+        copyLatestButton.isEnabled = !state.lastTranscription.isEmpty
+        retryLastButton.isHidden = !state.hasRecoverableRecording
+        retryLastButton.isEnabled = state.hasRecoverableRecording && !state.isBusy
+
+        view.needsLayout = true
+        view.layoutSubtreeIfNeeded()
+        let width = Layout.width
+        let height = max(196, view.fittingSize.height)
+        preferredContentSize = NSSize(width: width, height: height)
+        view.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        view.layoutSubtreeIfNeeded()
+    }
+
+    @objc private func copyLatest() {
+        guard !state.lastTranscription.isEmpty else { return }
+        if Clipboard.copy(state.lastTranscription) {
+            state.statusText = "Copied latest transcription"
+        } else {
+            state.statusText = "Copy failed"
+        }
+        refresh()
+    }
+
+    @objc private func retryLastRecording() {
+        (NSApp.delegate as? AppDelegate)?.retryLastRecordingObjc()
+    }
+
+    @objc private func quitWire() {
+        NSApp.terminate(nil)
+    }
+
+    @objc private func openSettingsPressed() {
+        onOpenSettings?()
+    }
+}
+
+// MARK: - Settings UI Helpers
+
+private enum WireUI {
+    enum Metrics {
+        static let settingsInset = NSEdgeInsets(top: 18, left: 28, bottom: 16, right: 28)
+        static let groupSpacing: CGFloat = 22
+        static let rowHeight: CGFloat = 34
+        static let rowInsetX: CGFloat = 0
+        static let iconSize: CGFloat = 16
+        static let iconTitleGap: CGFloat = 10
+        static let separatorInset: CGFloat = 0
+    }
+
+    static func divider() -> NSBox {
+        let box = NSBox()
+        box.boxType = .separator
+        return box
+    }
+
+    static func spacer(height: CGFloat) -> NSView {
+        let view = NSView()
+        view.heightAnchor.constraint(equalToConstant: height).isActive = true
+        view.setContentHuggingPriority(.required, for: .vertical)
+        view.setContentCompressionResistancePriority(.required, for: .vertical)
+        return view
+    }
+
+    static func popoverSectionLabel(_ text: String) -> NSView {
+        let label = NSTextField(labelWithString: text.uppercased())
+        label.font = .systemFont(ofSize: 10, weight: .medium)
+        label.textColor = .tertiaryLabelColor
+        let row = NSStackView(views: [label])
+        row.edgeInsets = NSEdgeInsets(top: 8, left: 14, bottom: 6, right: 14)
+        return row
+    }
+
+    static func settingsGroup(title: String, rows: [NSView]) -> NSView {
+        let column = NSStackView()
+        column.orientation = .vertical
+        column.spacing = 7
+        column.alignment = .width
+        column.translatesAutoresizingMaskIntoConstraints = false
+
+        let heading = NSTextField(labelWithString: title)
+        heading.font = .systemFont(ofSize: 12, weight: .medium)
+        heading.textColor = .secondaryLabelColor
+        heading.translatesAutoresizingMaskIntoConstraints = false
+        let headingRow = NSView()
+        headingRow.translatesAutoresizingMaskIntoConstraints = false
+        headingRow.addSubview(heading)
+        NSLayoutConstraint.activate([
+            heading.leadingAnchor.constraint(equalTo: headingRow.leadingAnchor),
+            heading.trailingAnchor.constraint(lessThanOrEqualTo: headingRow.trailingAnchor),
+            heading.topAnchor.constraint(equalTo: headingRow.topAnchor),
+            heading.bottomAnchor.constraint(equalTo: headingRow.bottomAnchor)
+        ])
+        column.addArrangedSubview(headingRow)
+
+        let card = NSStackView()
+        card.orientation = .vertical
+        card.spacing = 6
+        card.alignment = .width
+        card.detachesHiddenViews = true
+        card.translatesAutoresizingMaskIntoConstraints = false
+
+        for row in rows {
+            card.addArrangedSubview(row)
+        }
+        column.addArrangedSubview(card)
+        return column
+    }
+
+    static func insetRowSeparator() -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(separator)
+        NSLayoutConstraint.activate([
+            container.heightAnchor.constraint(equalToConstant: 1),
+            separator.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Metrics.separatorInset),
+            separator.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            separator.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+        ])
+        return container
+    }
+
+    static func menuRow(symbol: String, title: String, trailing: NSView) -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.heightAnchor.constraint(equalToConstant: Metrics.rowHeight).isActive = true
+
+        let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
+        icon.symbolConfiguration = .init(pointSize: 12, weight: .medium)
+        icon.contentTintColor = .tertiaryLabelColor
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 13)
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        trailing.translatesAutoresizingMaskIntoConstraints = false
+        trailing.setContentHuggingPriority(.required, for: .horizontal)
+        trailing.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        container.addSubview(icon)
+        container.addSubview(label)
+        container.addSubview(trailing)
+
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Metrics.rowInsetX),
+            icon.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: Metrics.iconSize),
+            icon.heightAnchor.constraint(equalToConstant: Metrics.iconSize),
+
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: Metrics.iconTitleGap),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailing.leadingAnchor, constant: -10),
+
+            trailing.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Metrics.rowInsetX),
+            trailing.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+        ])
+        return container
+    }
+
+    static func fullWidthFieldRow(symbol: String, title: String, field: NSView) -> NSView {
+        let column = NSStackView()
+        column.orientation = .vertical
+        column.spacing = 7
+        column.alignment = .width
+        column.translatesAutoresizingMaskIntoConstraints = false
+        column.edgeInsets = NSEdgeInsets(top: 6, left: Metrics.rowInsetX, bottom: 6, right: Metrics.rowInsetX)
+
+        let titleRow = NSStackView()
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = Metrics.iconTitleGap
+
+        let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
+        icon.symbolConfiguration = .init(pointSize: 12, weight: .medium)
+        icon.contentTintColor = .tertiaryLabelColor
+        icon.widthAnchor.constraint(equalToConstant: Metrics.iconSize).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: Metrics.iconSize).isActive = true
+
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 13)
+        titleRow.addArrangedSubview(icon)
+        titleRow.addArrangedSubview(label)
+
+        field.translatesAutoresizingMaskIntoConstraints = false
+        column.addArrangedSubview(titleRow)
+        column.addArrangedSubview(field)
+        return column
+    }
+
+    static func trailingGroup(_ views: [NSView]) -> NSView {
+        let group = NSStackView()
+        group.orientation = .horizontal
+        group.alignment = .centerY
+        group.spacing = 8
+        group.translatesAutoresizingMaskIntoConstraints = false
+        for view in views {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            group.addArrangedSubview(view)
+        }
+        return group
+    }
+
+    static func configureSwitch(_ control: NSSwitch, target: AnyObject?, action: Selector) {
+        control.target = target
+        control.action = action
+        control.controlSize = .small
+    }
+
+    static func configureInfoButton(_ button: NSButton, target: AnyObject?, action: Selector, accessibilityDescription: String) {
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.target = target
+        button.action = action
+        button.toolTip = accessibilityDescription
+        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: accessibilityDescription) {
+            infoImage.isTemplate = true
+            button.image = infoImage
+        }
+        button.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 18).isActive = true
+    }
+}
+
 
 final class HoverMenuButton: NSButton {
     private var isHovering = false
@@ -4252,17 +4880,60 @@ final class FlippedDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
-final class PopoverViewController: NSViewController, NSTextFieldDelegate {
+// MARK: - Settings View Controller
+
+final class SettingsViewController: NSViewController, NSTextFieldDelegate, NSToolbarDelegate {
     private enum Layout {
-        static let width: CGFloat = 300
+        static let minWidth: CGFloat = 480
+        static let minHeight: CGFloat = 280
     }
+
+    private enum SettingsPane: Int, CaseIterable {
+        case general
+        case headset
+        case computer
+
+        var title: String {
+            switch self {
+            case .general: return "General"
+            case .headset: return "Headset"
+            case .computer: return "Computer"
+            }
+        }
+
+        var symbolName: String {
+            switch self {
+            case .general: return "gearshape"
+            case .headset: return "headphones"
+            case .computer: return "desktopcomputer"
+            }
+        }
+
+        var toolbarIdentifier: NSToolbarItem.Identifier {
+            NSToolbarItem.Identifier("wire.settings.\(title.lowercased())")
+        }
+
+        var contentHeight: CGFloat {
+            switch self {
+            case .general: return 330
+            case .headset: return 360
+            case .computer: return 370
+            }
+        }
+    }
+
+    private static let toolbarIdentifier = NSToolbar.Identifier("wire.settings.toolbar")
 
     private let state: AppState
     private let hotKeyManager: HotKeyManager
     private let headsetProbeManager: HeadsetProbeManager
     private let scrollView = NSScrollView()
-    private let rootStack = NSStackView()
-    private let statusLabel = NSTextField(labelWithString: "")
+    private let documentView = FlippedDocumentView()
+    private let pageHost = NSStackView()
+    private let footerStatusLabel = NSTextField(labelWithString: "")
+    private let generalStack = NSStackView()
+    private let headsetStack = NSStackView()
+    private let computerStack = NSStackView()
     private let toggleShortcutButton = NSButton(title: "", target: nil, action: nil)
     private let holdShortcutButton = NSButton(title: "", target: nil, action: nil)
     private let headsetModePopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -4270,27 +4941,28 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private let sendEnterAfterPasteSwitch = NSSwitch()
     private let cleanupSwitch = NSSwitch()
     private let backgroundPasteSwitch = NSSwitch()
+    private let cleanupInfoButton = NSButton(title: "", target: nil, action: nil)
     private let backgroundPasteInfoButton = NSButton(title: "", target: nil, action: nil)
     private let airPodsControlSwitch = NSSwitch()
+    private let headsetControlsInfoButton = NSButton(title: "", target: nil, action: nil)
+    private let sendEnterInfoButton = NSButton(title: "", target: nil, action: nil)
     private let airPodsInfoButton = NSButton(title: "", target: nil, action: nil)
     private let computerControlsSwitch = NSSwitch()
     private let computerInfoButton = NSButton(title: "", target: nil, action: nil)
     private let computerCustomHarnessSwitch = NSSwitch()
     private let computerHarnessInfoButton = NSButton(title: "", target: nil, action: nil)
     private let computerAutoEnableSwitch = NSSwitch()
+    private let computerAutoEnableInfoButton = NSButton(title: "", target: nil, action: nil)
     private let computerAutoEnableField = NSTextField(string: "")
     private let computerAutoDisableField = NSTextField(string: "")
     private let computerHarnessField = NSTextField(string: "")
-    private let transcriptLabel = NSTextField(labelWithString: "No recent transcription")
-    private let copyLatestButton = NSButton(title: "", target: nil, action: nil)
-    private let retryLastButton = NSButton(title: "", target: nil, action: nil)
-    private let loadingIndicator = NSProgressIndicator()
     private var headsetSettingsRows: [NSView] = []
     private var computerModeRows: [NSView] = []
     private var computerAutoEnableRows: [NSView] = []
     private var computerHarnessRows: [NSView] = []
     private var headsetCollapsedSpacer: NSView?
     private var backgroundPasteInfoPopover: NSPopover?
+    private var settingsInfoPopover: NSPopover?
     private var airPodsInfoPopover: NSPopover?
     private var computerInfoPopover: NSPopover?
     private var computerHarnessInfoPopover: NSPopover?
@@ -4303,6 +4975,7 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     private var computerAutoEnableSaveWorkItem: DispatchWorkItem?
     private var computerAutoDisableSaveWorkItem: DispatchWorkItem?
     private var computerHarnessSaveWorkItem: DispatchWorkItem?
+    private var selectedPane: SettingsPane = .general
 
     init(state: AppState, hotKeyManager: HotKeyManager, headsetProbeManager: HeadsetProbeManager) {
         self.state = state
@@ -4316,341 +4989,270 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     }
 
     override func loadView() {
-        let visual = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: Layout.width, height: 0))
-        visual.material = .menu
-        visual.blendingMode = .behindWindow
-        visual.state = .active
-        view = visual
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: SettingsPane.general.contentHeight))
+        view.wantsLayer = true
         buildUI()
         refresh()
     }
 
     private func buildUI() {
+        footerStatusLabel.font = .systemFont(ofSize: 11)
+        footerStatusLabel.textColor = .secondaryLabelColor
+        footerStatusLabel.lineBreakMode = .byTruncatingTail
+        footerStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+
         scrollView.drawsBackground = false
+        scrollView.backgroundColor = .windowBackgroundColor
         scrollView.hasHorizontalScroller = false
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
-        scrollView.scrollerStyle = .overlay
+        scrollView.borderType = .noBorder
         scrollView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(scrollView)
 
-        let documentView = FlippedDocumentView()
         documentView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.documentView = documentView
 
-        rootStack.orientation = .vertical
-        rootStack.spacing = 0
-        rootStack.detachesHiddenViews = true
-        rootStack.edgeInsets = NSEdgeInsets(top: 8, left: 0, bottom: 6, right: 0)
-        rootStack.translatesAutoresizingMaskIntoConstraints = false
-        documentView.addSubview(rootStack)
+        pageHost.orientation = .vertical
+        pageHost.alignment = .width
+        pageHost.spacing = 0
+        pageHost.detachesHiddenViews = true
+        pageHost.translatesAutoresizingMaskIntoConstraints = false
+        documentView.addSubview(pageHost)
+
+        configureTabStack(generalStack)
+        configureTabStack(headsetStack)
+        configureTabStack(computerStack)
+        buildGeneralTab()
+        buildHeadsetTab()
+        buildComputerTab()
+        selectSettingsPane(.general)
+
+        view.addSubview(scrollView)
+
         NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+            scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: Layout.minWidth),
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: Layout.minHeight),
 
             documentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
             documentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
             documentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
             documentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
-            documentView.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor),
 
-            rootStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
-            rootStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
-            rootStack.topAnchor.constraint(equalTo: documentView.topAnchor),
-            rootStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor)
+            pageHost.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
+            pageHost.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
+            pageHost.topAnchor.constraint(equalTo: documentView.topAnchor),
+            pageHost.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -12)
         ])
+    }
 
-        let header = NSStackView()
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 10
-        header.edgeInsets = NSEdgeInsets(top: 6, left: 14, bottom: 11, right: 14)
+    private func configureTabStack(_ stack: NSStackView) {
+        stack.orientation = .vertical
+        stack.spacing = WireUI.Metrics.groupSpacing
+        stack.alignment = .width
+        stack.edgeInsets = WireUI.Metrics.settingsInset
+        stack.translatesAutoresizingMaskIntoConstraints = false
+    }
 
-        let mic = NSImageView(image: NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil) ?? NSImage())
-        mic.symbolConfiguration = .init(pointSize: 13, weight: .semibold)
-        mic.contentTintColor = .controlAccentColor
-        mic.widthAnchor.constraint(equalToConstant: 14).isActive = true
-        mic.heightAnchor.constraint(equalToConstant: 14).isActive = true
+    func makeToolbar() -> NSToolbar {
+        let toolbar = NSToolbar(identifier: Self.toolbarIdentifier)
+        toolbar.delegate = self
+        toolbar.displayMode = .iconAndLabel
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
+        toolbar.selectedItemIdentifier = selectedPane.toolbarIdentifier
+        return toolbar
+    }
 
-        let titleRow = NSStackView()
-        titleRow.orientation = .horizontal
-        titleRow.alignment = .centerY
-        titleRow.spacing = 5
-        let title = NSTextField(labelWithString: "wire")
-        title.font = .systemFont(ofSize: 14, weight: .semibold)
-        titleRow.addArrangedSubview(mic)
-        titleRow.addArrangedSubview(title)
-
-        let titleStack = NSStackView()
-        titleStack.orientation = .vertical
-        titleStack.spacing = 2
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.lineBreakMode = .byTruncatingTail
-        titleStack.addArrangedSubview(titleRow)
-        titleStack.addArrangedSubview(statusLabel)
-
-        loadingIndicator.style = .spinning
-        loadingIndicator.controlSize = .small
-        loadingIndicator.isIndeterminate = true
-        loadingIndicator.isDisplayedWhenStopped = false
-        loadingIndicator.widthAnchor.constraint(equalToConstant: 16).isActive = true
-        loadingIndicator.heightAnchor.constraint(equalToConstant: 16).isActive = true
-
-        header.addArrangedSubview(titleStack)
-        header.addArrangedSubview(loadingIndicator)
-        rootStack.addArrangedSubview(header)
-        rootStack.addArrangedSubview(divider())
-
-        rootStack.addArrangedSubview(sectionLabel("Latest"))
-        transcriptLabel.font = .systemFont(ofSize: 12)
-        transcriptLabel.textColor = .secondaryLabelColor
-        transcriptLabel.lineBreakMode = .byWordWrapping
-        transcriptLabel.maximumNumberOfLines = 3
-        transcriptLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        transcriptLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        copyLatestButton.target = self
-        copyLatestButton.action = #selector(copyLatest)
-        copyLatestButton.bezelStyle = .inline
-        copyLatestButton.isBordered = false
-        copyLatestButton.imagePosition = .imageOnly
-        copyLatestButton.toolTip = "Copy latest transcription"
-        if let copyImage = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy latest") {
-            copyImage.isTemplate = true
-            copyLatestButton.image = copyImage
+    private func selectSettingsPane(_ pane: SettingsPane) {
+        selectedPane = pane
+        view.window?.toolbar?.selectedItemIdentifier = pane.toolbarIdentifier
+        while let subview = pageHost.arrangedSubviews.first {
+            pageHost.removeArrangedSubview(subview)
+            subview.removeFromSuperview()
         }
-        copyLatestButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        copyLatestButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
-
-        retryLastButton.target = self
-        retryLastButton.action = #selector(retryLastRecording)
-        retryLastButton.bezelStyle = .inline
-        retryLastButton.isBordered = false
-        retryLastButton.imagePosition = .imageOnly
-        retryLastButton.toolTip = "Retry saved recording"
-        if let retryImage = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Retry saved recording") {
-            retryImage.isTemplate = true
-            retryLastButton.image = retryImage
+        let activeStack: NSStackView
+        switch pane {
+        case .general: activeStack = generalStack
+        case .headset: activeStack = headsetStack
+        case .computer: activeStack = computerStack
         }
-        retryLastButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        retryLastButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        pageHost.addArrangedSubview(activeStack)
+        resizeWindowForSelectedPane()
+    }
 
-        let latestRow = NSStackView()
-        latestRow.orientation = .horizontal
-        latestRow.alignment = .centerY
-        latestRow.spacing = 8
-        latestRow.addArrangedSubview(transcriptLabel)
-        latestRow.addArrangedSubview(retryLastButton)
-        latestRow.addArrangedSubview(copyLatestButton)
-        rootStack.addArrangedSubview(padded(latestRow, left: 14, right: 14, top: 3, bottom: 8))
+    func resizeWindowForSelectedPane() {
+        guard let window = view.window else { return }
+        let width = max(window.contentView?.bounds.width ?? 560, Layout.minWidth)
+        window.setContentSize(NSSize(width: width, height: selectedPane.contentHeight))
+    }
 
-        rootStack.addArrangedSubview(divider())
-        rootStack.addArrangedSubview(sectionLabel("Settings"))
+    @objc private func settingsToolbarItemSelected(_ sender: NSToolbarItem) {
+        guard let pane = SettingsPane.allCases.first(where: { $0.toolbarIdentifier == sender.itemIdentifier }) else {
+            return
+        }
+        selectSettingsPane(pane)
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        SettingsPane.allCases.map(\.toolbarIdentifier)
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        SettingsPane.allCases.map(\.toolbarIdentifier)
+    }
+
+    func toolbarSelectableItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        SettingsPane.allCases.map(\.toolbarIdentifier)
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        guard let pane = SettingsPane.allCases.first(where: { $0.toolbarIdentifier == itemIdentifier }) else {
+            return nil
+        }
+
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        item.label = pane.title
+        item.paletteLabel = pane.title
+        item.toolTip = pane.title
+        item.target = self
+        item.action = #selector(settingsToolbarItemSelected(_:))
+        if let image = NSImage(systemSymbolName: pane.symbolName, accessibilityDescription: pane.title) {
+            image.isTemplate = true
+            item.image = image
+        }
+        return item
+    }
+
+    private func buildGeneralTab() {
+        configureShortcutButton(holdShortcutButton)
+        configureShortcutButton(toggleShortcutButton)
         holdShortcutButton.target = self
         holdShortcutButton.action = #selector(captureHoldShortcut)
-        rootStack.addArrangedSubview(menuRow(symbol: "keyboard.badge.ellipsis", title: "Hold shortcut", trailing: holdShortcutButton))
-        rootStack.addArrangedSubview(spacer(height: 7))
-
         toggleShortcutButton.target = self
         toggleShortcutButton.action = #selector(captureToggleShortcut)
-        rootStack.addArrangedSubview(menuRow(symbol: "keyboard", title: "Toggle shortcut", trailing: toggleShortcutButton))
+        WireUI.configureSwitch(cleanupSwitch, target: self, action: #selector(toggleCleanup))
+        WireUI.configureSwitch(backgroundPasteSwitch, target: self, action: #selector(toggleBackgroundPaste))
+        WireUI.configureInfoButton(cleanupInfoButton, target: self, action: #selector(showCleanupInfo), accessibilityDescription: "Clean up transcript details")
+        WireUI.configureInfoButton(backgroundPasteInfoButton, target: self, action: #selector(showBackgroundPasteInfo), accessibilityDescription: "Paste to source app details")
 
-        configureSwitch(cleanupSwitch, action: #selector(toggleCleanup))
-        let cleanupRow = menuRow(symbol: "text.badge.checkmark", title: "Clean up transcript", trailing: cleanupSwitch)
-        rootStack.addArrangedSubview(cleanupRow)
+        let shortcutRows = [
+            WireUI.menuRow(symbol: "keyboard.badge.ellipsis", title: "Hold shortcut", trailing: holdShortcutButton),
+            WireUI.menuRow(symbol: "keyboard", title: "Toggle shortcut", trailing: toggleShortcutButton)
+        ]
+        generalStack.addArrangedSubview(WireUI.settingsGroup(title: "Shortcuts", rows: shortcutRows))
 
-        configureSwitch(backgroundPasteSwitch, action: #selector(toggleBackgroundPaste))
-        configureInfoButton(backgroundPasteInfoButton, action: #selector(showBackgroundPasteInfo), accessibilityDescription: "Paste to source app details")
-        let backgroundPasteRow = menuRow(symbol: "arrowshape.turn.up.left", title: "Paste to source app", trailing: trailingGroup([backgroundPasteInfoButton, backgroundPasteSwitch]))
-        rootStack.addArrangedSubview(backgroundPasteRow)
-        rootStack.addArrangedSubview(spacer(height: 8))
+        let transcriptionRows = [
+            WireUI.menuRow(symbol: "text.badge.checkmark", title: "Clean up transcript", trailing: WireUI.trailingGroup([cleanupInfoButton, cleanupSwitch])),
+            WireUI.menuRow(symbol: "arrowshape.turn.up.left", title: "Paste to source app", trailing: WireUI.trailingGroup([backgroundPasteInfoButton, backgroundPasteSwitch]))
+        ]
+        generalStack.addArrangedSubview(WireUI.settingsGroup(title: "Transcription", rows: transcriptionRows))
+    }
 
-        rootStack.addArrangedSubview(divider())
-        rootStack.addArrangedSubview(sectionLabel("Headset"))
-        configureSwitch(headsetControlsSwitch, action: #selector(toggleHeadsetControls))
-        rootStack.addArrangedSubview(menuRow(symbol: "switch.2", title: "Headset controls", trailing: headsetControlsSwitch))
-        let collapsedSpacer = spacer(height: 7)
-        rootStack.addArrangedSubview(collapsedSpacer)
-        headsetCollapsedSpacer = collapsedSpacer
+    private func configureShortcutButton(_ button: NSButton) {
+        button.bezelStyle = .rounded
+        button.controlSize = .regular
+        button.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.widthAnchor.constraint(equalToConstant: 148).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        if let cell = button.cell as? NSButtonCell {
+            cell.wraps = false
+            cell.lineBreakMode = .byTruncatingTail
+            cell.usesSingleLineMode = true
+        }
+    }
 
+    private func buildHeadsetTab() {
+        WireUI.configureSwitch(headsetControlsSwitch, target: self, action: #selector(toggleHeadsetControls))
         headsetModePopup.addItems(withTitles: HeadsetButtonMode.allCases.map(\.title))
         headsetModePopup.target = self
         headsetModePopup.action = #selector(changeHeadsetMode)
-        headsetModePopup.widthAnchor.constraint(equalToConstant: 178).isActive = true
-        let wiredButtonRow = menuRow(symbol: "headphones", title: "Wired button", trailing: headsetModePopup)
-        rootStack.addArrangedSubview(wiredButtonRow)
+        headsetModePopup.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        WireUI.configureSwitch(sendEnterAfterPasteSwitch, target: self, action: #selector(toggleSendEnterAfterPaste))
+        WireUI.configureSwitch(airPodsControlSwitch, target: self, action: #selector(toggleAirPodsControl))
+        WireUI.configureInfoButton(headsetControlsInfoButton, target: self, action: #selector(showHeadsetControlsInfo), accessibilityDescription: "Headset controls details")
+        WireUI.configureInfoButton(sendEnterInfoButton, target: self, action: #selector(showSendEnterInfo), accessibilityDescription: "Wired sends Return details")
+        WireUI.configureInfoButton(airPodsInfoButton, target: self, action: #selector(showAirPodsInfo), accessibilityDescription: "Experimental AirPods details")
 
-        configureSwitch(sendEnterAfterPasteSwitch, action: #selector(toggleSendEnterAfterPaste))
-        let sendEnterRow = menuRow(symbol: "return", title: "Wired sends Return", trailing: sendEnterAfterPasteSwitch)
-        rootStack.addArrangedSubview(sendEnterRow)
+        let wiredButtonRow = WireUI.menuRow(symbol: "headphones", title: "Wired button", trailing: headsetModePopup)
+        let sendEnterRow = WireUI.menuRow(symbol: "return", title: "Wired sends Return", trailing: WireUI.trailingGroup([sendEnterInfoButton, sendEnterAfterPasteSwitch]))
+        let airPodsControlRow = WireUI.menuRow(symbol: "airpodspro", title: "AirPods controls (experimental)", trailing: WireUI.trailingGroup([airPodsInfoButton, airPodsControlSwitch]))
+        headsetSettingsRows = [wiredButtonRow, airPodsControlRow, sendEnterRow]
 
-        configureSwitch(airPodsControlSwitch, action: #selector(toggleAirPodsControl))
-        configureInfoButton(airPodsInfoButton, action: #selector(showAirPodsInfo), accessibilityDescription: "Experimental AirPods details")
-        let airPodsControlRow = menuRow(symbol: "airpodspro", title: "AirPods controls (experimental)", trailing: trailingGroup([airPodsInfoButton, airPodsControlSwitch]))
-        rootStack.addArrangedSubview(airPodsControlRow)
+        let controlsRows = [
+            WireUI.menuRow(symbol: "switch.2", title: "Headset controls", trailing: WireUI.trailingGroup([headsetControlsInfoButton, headsetControlsSwitch]))
+        ]
+        headsetStack.addArrangedSubview(WireUI.settingsGroup(title: "Controls", rows: controlsRows))
+        headsetStack.addArrangedSubview(WireUI.settingsGroup(title: "Wired Headset", rows: [wiredButtonRow, sendEnterRow]))
+        headsetStack.addArrangedSubview(WireUI.settingsGroup(title: "AirPods", rows: [airPodsControlRow]))
+    }
 
-        let headsetBottomSpacer = spacer(height: 5)
-        rootStack.addArrangedSubview(headsetBottomSpacer)
-        headsetSettingsRows = [wiredButtonRow, airPodsControlRow, sendEnterRow, headsetBottomSpacer]
-
-        rootStack.addArrangedSubview(divider())
-        rootStack.addArrangedSubview(sectionLabel("Computer"))
-        configureSwitch(computerControlsSwitch, action: #selector(toggleComputerControls))
-        configureInfoButton(computerInfoButton, action: #selector(showComputerInfo), accessibilityDescription: "Computer mode details")
-        rootStack.addArrangedSubview(menuRow(symbol: "desktopcomputer", title: "Computer mode (dangerous)", trailing: trailingGroup([computerInfoButton, computerControlsSwitch])))
-
-        configureSwitch(computerCustomHarnessSwitch, action: #selector(toggleComputerCustomHarness))
-        configureInfoButton(computerHarnessInfoButton, action: #selector(showComputerHarnessInfo), accessibilityDescription: "Custom harness details")
-        let customHarnessToggleRow = menuRow(symbol: "terminal", title: "Custom harness", trailing: trailingGroup([computerHarnessInfoButton, computerCustomHarnessSwitch]))
-        rootStack.addArrangedSubview(customHarnessToggleRow)
+    private func buildComputerTab() {
+        WireUI.configureSwitch(computerControlsSwitch, target: self, action: #selector(toggleComputerControls))
+        WireUI.configureInfoButton(computerInfoButton, target: self, action: #selector(showComputerInfo), accessibilityDescription: "Computer mode details")
+        WireUI.configureSwitch(computerCustomHarnessSwitch, target: self, action: #selector(toggleComputerCustomHarness))
+        WireUI.configureInfoButton(computerHarnessInfoButton, target: self, action: #selector(showComputerHarnessInfo), accessibilityDescription: "Custom harness details")
+        WireUI.configureSwitch(computerAutoEnableSwitch, target: self, action: #selector(toggleComputerAutoEnable))
+        WireUI.configureInfoButton(computerAutoEnableInfoButton, target: self, action: #selector(showComputerAutoEnableInfo), accessibilityDescription: "Voice trigger details")
 
         computerHarnessField.placeholderString = "codex --yolo -c 'model_reasoning_effort=\"low\"' e {{prompt}}"
         computerHarnessField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         computerHarnessField.bezelStyle = .roundedBezel
-        computerHarnessField.focusRingType = .none
+        computerHarnessField.focusRingType = .default
         computerHarnessField.controlSize = .small
         computerHarnessField.delegate = self
         computerHarnessField.target = self
         computerHarnessField.action = #selector(updateComputerHarnessCommand)
-        computerHarnessField.widthAnchor.constraint(equalToConstant: 176).isActive = true
-        computerHarnessField.heightAnchor.constraint(equalToConstant: 26).isActive = true
-        let commandRow = menuRow(symbol: "chevron.right.square", title: "Command", trailing: computerHarnessField)
-        rootStack.addArrangedSubview(commandRow)
 
-        configureSwitch(computerAutoEnableSwitch, action: #selector(toggleComputerAutoEnable))
-        let autoEnableToggleRow = menuRow(symbol: "bolt.badge.automatic", title: "Auto enable", trailing: computerAutoEnableSwitch)
-        rootStack.addArrangedSubview(autoEnableToggleRow)
-
-        computerAutoEnableField.placeholderString = "At least two words"
-        computerAutoEnableField.font = .systemFont(ofSize: 12)
-        computerAutoEnableField.bezelStyle = .roundedBezel
-        computerAutoEnableField.focusRingType = .none
-        computerAutoEnableField.controlSize = .small
-        computerAutoEnableField.delegate = self
-        computerAutoEnableField.target = self
+        for field in [computerAutoEnableField, computerAutoDisableField] {
+            field.placeholderString = "At least two words"
+            field.font = .systemFont(ofSize: 12)
+            field.bezelStyle = .roundedBezel
+            field.focusRingType = .default
+            field.controlSize = .small
+            field.delegate = self
+            field.target = self
+        }
+        for field in [computerAutoEnableField, computerAutoDisableField] {
+            field.widthAnchor.constraint(equalToConstant: 168).isActive = true
+            field.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        }
+        computerHarnessField.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        computerHarnessField.widthAnchor.constraint(lessThanOrEqualToConstant: 480).isActive = true
+        computerHarnessField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         computerAutoEnableField.action = #selector(updateComputerAutoEnablePhrase)
-        computerAutoEnableField.widthAnchor.constraint(equalToConstant: 142).isActive = true
-        computerAutoEnableField.heightAnchor.constraint(equalToConstant: 26).isActive = true
-
-        let enablePhraseRow = menuRow(symbol: "text.cursor", title: "Enable phrase", trailing: computerAutoEnableField)
-        rootStack.addArrangedSubview(enablePhraseRow)
-
-        computerAutoDisableField.placeholderString = "At least two words"
-        computerAutoDisableField.font = .systemFont(ofSize: 12)
-        computerAutoDisableField.bezelStyle = .roundedBezel
-        computerAutoDisableField.focusRingType = .none
-        computerAutoDisableField.controlSize = .small
-        computerAutoDisableField.delegate = self
-        computerAutoDisableField.target = self
         computerAutoDisableField.action = #selector(updateComputerAutoDisablePhrase)
-        computerAutoDisableField.widthAnchor.constraint(equalToConstant: 142).isActive = true
-        computerAutoDisableField.heightAnchor.constraint(equalToConstant: 26).isActive = true
 
-        let disablePhraseRow = menuRow(symbol: "text.cursor", title: "Disable phrase", trailing: computerAutoDisableField)
-        rootStack.addArrangedSubview(disablePhraseRow)
-        let computerBottomSpacer = spacer(height: 9)
-        rootStack.addArrangedSubview(computerBottomSpacer)
+        let customHarnessToggleRow = WireUI.menuRow(symbol: "terminal", title: "Custom harness", trailing: WireUI.trailingGroup([computerHarnessInfoButton, computerCustomHarnessSwitch]))
+        let commandRow = WireUI.fullWidthFieldRow(symbol: "chevron.right.square", title: "Command", field: computerHarnessField)
+        let autoEnableToggleRow = WireUI.menuRow(symbol: "bolt.badge.automatic", title: "Auto enable", trailing: WireUI.trailingGroup([computerAutoEnableInfoButton, computerAutoEnableSwitch]))
+        let enablePhraseRow = WireUI.menuRow(symbol: "text.cursor", title: "Enable phrase", trailing: computerAutoEnableField)
+        let disablePhraseRow = WireUI.menuRow(symbol: "text.cursor", title: "Disable phrase", trailing: computerAutoDisableField)
         computerModeRows = [customHarnessToggleRow]
         computerHarnessRows = [commandRow]
         computerAutoEnableRows = [enablePhraseRow, disablePhraseRow]
 
-        rootStack.addArrangedSubview(divider())
-        rootStack.addArrangedSubview(clickableMenuRow(symbol: "power", title: "Quit", action: #selector(quitApp), destructive: true))
+        computerStack.addArrangedSubview(WireUI.settingsGroup(title: "Computer Mode", rows: [
+            WireUI.menuRow(symbol: "desktopcomputer", title: "Computer mode (dangerous)", trailing: WireUI.trailingGroup([computerInfoButton, computerControlsSwitch])),
+            customHarnessToggleRow,
+            commandRow
+        ]))
+        computerStack.addArrangedSubview(WireUI.settingsGroup(title: "Voice Triggers", rows: [
+            autoEnableToggleRow,
+            enablePhraseRow,
+            disablePhraseRow
+        ]))
     }
 
-    private func divider() -> NSBox {
-        let box = NSBox()
-        box.boxType = .separator
-        return box
-    }
-
-    private func spacer(height: CGFloat) -> NSView {
-        let view = NSView()
-        view.heightAnchor.constraint(equalToConstant: height).isActive = true
-        view.setContentHuggingPriority(.required, for: .vertical)
-        view.setContentCompressionResistancePriority(.required, for: .vertical)
-        return view
-    }
-
-    private func sectionLabel(_ text: String) -> NSView {
-        let label = NSTextField(labelWithString: text.uppercased())
-        label.font = .systemFont(ofSize: 10, weight: .medium)
-        label.textColor = .tertiaryLabelColor
-        return padded(label, left: 14, right: 14, top: 8, bottom: 7)
-    }
-
-    private func padded(_ child: NSView, left: CGFloat, right: CGFloat, top: CGFloat, bottom: CGFloat) -> NSView {
-        let container = NSView()
-        child.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(child)
-        NSLayoutConstraint.activate([
-            child.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: left),
-            child.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -right),
-            child.topAnchor.constraint(equalTo: container.topAnchor, constant: top),
-            child.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -bottom)
-        ])
-        return container
-    }
-
-    private func configureSwitch(_ control: NSSwitch, action: Selector) {
-        control.target = self
-        control.action = action
-        control.controlSize = .small
-        control.widthAnchor.constraint(equalToConstant: 38).isActive = true
-        control.heightAnchor.constraint(equalToConstant: 22).isActive = true
-    }
-
-    private func configureInfoButton(_ button: NSButton, action: Selector, accessibilityDescription: String) {
-        button.bezelStyle = .inline
-        button.isBordered = false
-        button.imagePosition = .imageOnly
-        button.target = self
-        button.action = action
-        if let infoImage = NSImage(systemSymbolName: "info.circle", accessibilityDescription: accessibilityDescription) {
-            infoImage.isTemplate = true
-            button.image = infoImage
-        }
-        button.widthAnchor.constraint(equalToConstant: 20).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 20).isActive = true
-    }
-
-    private func menuRow(symbol: String, title: String, trailing: NSView) -> NSView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 10
-        row.edgeInsets = NSEdgeInsets(top: 4, left: 14, bottom: 4, right: 14)
-        row.setContentHuggingPriority(.required, for: .vertical)
-        row.setContentCompressionResistancePriority(.required, for: .vertical)
-
-        let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil) ?? NSImage())
-        icon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
-        icon.contentTintColor = .secondaryLabelColor
-        icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
-
-        let label = NSTextField(labelWithString: title)
-        label.font = .systemFont(ofSize: 13)
-        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        row.addArrangedSubview(icon)
-        row.addArrangedSubview(label)
-        row.addArrangedSubview(trailing)
-        return row
-    }
-
-    private func trailingGroup(_ views: [NSView]) -> NSView {
-        let group = NSStackView()
-        group.orientation = .horizontal
-        group.alignment = .centerY
-        group.spacing = 6
-        for view in views {
-            group.addArrangedSubview(view)
-        }
-        return group
-    }
 
     private func clickableMenuRow(symbol: String, title: String, action: Selector, destructive: Bool = false) -> NSView {
         let button = HoverMenuButton(title: "", target: self, action: action)
@@ -4716,12 +5318,12 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
                 && !autoDisablePhrase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && self.autoEnablePhraseWordCount(autoDisablePhrase) < 2
             let hasInvalidAutoPhrase = hasInvalidAutoEnablePhrase || hasInvalidAutoDisablePhrase
-            self.statusLabel.stringValue = hasInvalidAutoEnablePhrase
+            self.footerStatusLabel.stringValue = hasInvalidAutoEnablePhrase
                 ? "Minimum 2 words"
                 : hasInvalidAutoDisablePhrase
                 ? "Disable phrase needs 2 words"
                 : (self.state.statusText.isEmpty ? "Ready" : self.state.statusText)
-            self.statusLabel.textColor = hasInvalidAutoPhrase ? .systemRed : .secondaryLabelColor
+            self.footerStatusLabel.textColor = hasInvalidAutoPhrase ? .systemRed : .secondaryLabelColor
             if self.shortcutCaptureTarget == nil {
                 self.holdShortcutButton.title = self.hotKeyManager.holdShortcutDisplay
                 self.toggleShortcutButton.title = self.hotKeyManager.toggleShortcutDisplay
@@ -4733,19 +5335,6 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
                     self.toggleShortcutButton.title = self.hotKeyManager.toggleShortcutDisplay
                 }
                 self.updateShortcutCaptureDisplay()
-            }
-
-            switch self.state.transcriptionStage {
-            case .recording:
-                self.loadingIndicator.stopAnimation(nil)
-            case .transcribing:
-                self.loadingIndicator.startAnimation(nil)
-            default:
-                if self.state.computerCommandRunning {
-                    self.loadingIndicator.startAnimation(nil)
-                } else {
-                    self.loadingIndicator.stopAnimation(nil)
-                }
             }
 
             self.headsetControlsSwitch.state = self.state.headsetControlsEnabled ? .on : .off
@@ -4778,45 +5367,12 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
             let showComputerPhrase = self.state.computerAutoEnableEnabled
             self.computerAutoEnableRows.forEach { $0.isHidden = !showComputerPhrase }
 
-            if self.state.computerCommandRunning {
-                let usesCustomHarness = self.state.computerCustomHarnessEnabled && !self.state.computerHarnessCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                self.transcriptLabel.stringValue = usesCustomHarness ? "Running harness..." : "Running codex..."
-            } else if self.state.transcriptionStage == .transcribing {
-                self.transcriptLabel.stringValue = "Loading… transcribing audio"
-            } else {
-                self.transcriptLabel.stringValue = self.state.lastTranscription.isEmpty ? "No recent transcription" : self.state.lastTranscription
-            }
-            self.copyLatestButton.isEnabled = !self.transcriptLabel.stringValue.isEmpty && self.transcriptLabel.stringValue != "No recent transcription"
-            self.retryLastButton.isHidden = !self.state.hasRecoverableRecording
-            self.retryLastButton.isEnabled = self.state.hasRecoverableRecording && !self.state.isBusy
-            self.updatePreferredContentSize()
         }
         if Thread.isMainThread {
             apply()
         } else {
             DispatchQueue.main.async(execute: apply)
         }
-    }
-
-    private func updatePreferredContentSize() {
-        let latestTextWidth = Layout.width - 14 - 14 - 8 - 24 - 8 - 24
-        transcriptLabel.preferredMaxLayoutWidth = latestTextWidth
-        view.layoutSubtreeIfNeeded()
-        rootStack.layoutSubtreeIfNeeded()
-
-        let contentHeight = ceil(rootStack.fittingSize.height)
-        let maxHeight = maxPopoverHeight()
-        let height = min(contentHeight, maxHeight)
-        preferredContentSize = NSSize(width: Layout.width, height: height)
-    }
-
-    private func maxPopoverHeight() -> CGFloat {
-        let mouseLocation = NSEvent.mouseLocation
-        let screen = view.window?.screen
-            ?? NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
-            ?? NSScreen.main
-        let visibleHeight = screen?.visibleFrame.height ?? 720
-        return max(360, floor(visibleHeight - 72))
     }
 
     private func autoEnablePhraseWordCount(_ phrase: String) -> Int {
@@ -4830,19 +5386,6 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
 
     @objc private func trigger() {
         (NSApp.delegate as? AppDelegate)?.perform(#selector(AppDelegate.handleTranscribeObjc), with: nil, afterDelay: 0)
-    }
-
-    @objc private func copyLatest() {
-        guard !state.lastTranscription.isEmpty else { return }
-        if Clipboard.copy(state.lastTranscription) {
-            state.statusText = "Copied latest transcription"
-        } else {
-            state.statusText = "Could not copy latest transcription"
-        }
-    }
-
-    @objc private func retryLastRecording() {
-        (NSApp.delegate as? AppDelegate)?.retryLastRecordingObjc()
     }
 
     @objc private func toggleHeadsetControls() {
@@ -4907,6 +5450,76 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
     @objc private func toggleCleanup() {
         (NSApp.delegate as? AppDelegate)?.setCleanupEnabled(cleanupSwitch.state == .on)
         refresh()
+    }
+
+    @objc private func showCleanupInfo() {
+        showSettingsInfo(
+            from: cleanupInfoButton,
+            text: "Removes filler words, repeated fragments, and obvious transcription artifacts before pasting or copying the transcript.",
+            size: NSSize(width: 258, height: 86)
+        )
+    }
+
+    @objc private func showHeadsetControlsInfo() {
+        showSettingsInfo(
+            from: headsetControlsInfoButton,
+            text: "Enables wired headset button detection and optional AirPods controls. Turn this off if media controls or headset buttons behave unexpectedly.",
+            size: NSSize(width: 270, height: 104)
+        )
+    }
+
+    @objc private func showSendEnterInfo() {
+        showSettingsInfo(
+            from: sendEnterInfoButton,
+            text: "After a wired headset recording is pasted, wire also sends Return. This is useful for chat inputs that submit with Return.",
+            size: NSSize(width: 270, height: 92)
+        )
+    }
+
+    @objc private func showComputerAutoEnableInfo() {
+        showSettingsInfo(
+            from: computerAutoEnableInfoButton,
+            text: "When enabled, wire listens for the enable phrase while Computer mode is off and the disable phrase while it is on. Phrases need at least two words.",
+            size: NSSize(width: 280, height: 110)
+        )
+    }
+
+    private func showSettingsInfo(from button: NSButton, text: String, size: NSSize) {
+        if let settingsInfoPopover, settingsInfoPopover.isShown {
+            settingsInfoPopover.performClose(nil)
+            return
+        }
+
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 0
+        label.preferredMaxLayoutWidth = size.width - 24
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(origin: .zero, size: size))
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: size.width),
+            container.heightAnchor.constraint(equalToConstant: size.height),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10)
+        ])
+
+        let controller = NSViewController()
+        controller.view = container
+        controller.preferredContentSize = size
+
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentSize = size
+        popover.contentViewController = controller
+        settingsInfoPopover = popover
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
     }
 
     @objc private func toggleBackgroundPaste() {
@@ -5224,6 +5837,17 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         captureButton(for: target).title = hotKeyManager.displayShortcut(modifiers: modifiers, keyCode: keyCode)
     }
 
+    func collectUISelfTestMetrics(into lines: inout [String]) {
+        holdShortcutButton.title = hotKeyManager.holdShortcutDisplay
+        toggleShortcutButton.title = hotKeyManager.toggleShortcutDisplay
+        lines.append("holdShortcutTitle=\(holdShortcutButton.title)")
+        lines.append("toggleShortcutTitle=\(toggleShortcutButton.title)")
+        lines.append("holdShortcutFrame=\(holdShortcutButton.frame.integral)")
+        lines.append("toggleShortcutFrame=\(toggleShortcutButton.frame.integral)")
+        lines.append("holdShortcutLines=\(holdShortcutButton.title.components(separatedBy: "\n").count)")
+        lines.append("toggleShortcutLines=\(toggleShortcutButton.title.components(separatedBy: "\n").count)")
+    }
+
     private func captureButton(for target: HotKeyKind) -> NSButton {
         switch target {
         case .toggle:
@@ -5231,10 +5855,6 @@ final class PopoverViewController: NSViewController, NSTextFieldDelegate {
         case .hold:
             return holdShortcutButton
         }
-    }
-
-    @objc private func quitApp() {
-        NSApp.terminate(nil)
     }
 }
 
