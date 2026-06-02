@@ -829,9 +829,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         popover.contentViewController = menuController
 
         state.onChange = { [weak self, weak menuController] in
-            self?.renderStatusItem()
-            menuController?.refresh()
-            self?.settingsController?.refresh()
+            DispatchQueue.main.async {
+                self?.renderStatusItem()
+                menuController?.refresh()
+                self?.settingsController?.refresh()
+            }
         }
         refreshRecoverableRecordingState()
         hotKeyManager.registerSavedShortcuts()
@@ -1828,6 +1830,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    @MainActor
     private func processTranscriptionQueue() async {
         while !queuedTranscriptionJobs.isEmpty {
             let job = queuedTranscriptionJobs.removeFirst()
@@ -1850,6 +1853,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    @MainActor
     private func processTranscriptionJob(_ job: QueuedTranscriptionJob) async {
         if !recorder.hasActiveRecording {
             state.transcriptionStage = .transcribing
