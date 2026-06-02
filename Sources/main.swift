@@ -138,6 +138,21 @@ private struct BackgroundPasteTarget {
     let selectedTextRange: CFRange?
     let cmuxTarget: CmuxPasteTarget?
     let summary: String
+
+    var needsCmuxResolution: Bool {
+        bundleIdentifier == "com.cmuxterm.app" && cmuxTarget == nil
+    }
+
+    func withCmuxTarget(_ cmuxTarget: CmuxPasteTarget?) -> BackgroundPasteTarget {
+        BackgroundPasteTarget(
+            pid: pid,
+            bundleIdentifier: bundleIdentifier,
+            element: element,
+            selectedTextRange: selectedTextRange,
+            cmuxTarget: cmuxTarget,
+            summary: summary
+        )
+    }
 }
 
 private struct CmuxPasteTarget {
@@ -154,7 +169,7 @@ private enum BackgroundPasteResult {
 }
 
 private enum BackgroundPaste {
-    static func captureIfTrusted() -> BackgroundPasteTarget? {
+    static func captureIfTrusted(resolveCmuxTarget: Bool = true) -> BackgroundPasteTarget? {
         guard AXIsProcessTrusted() else { return nil }
 
         guard let element = focusedElement() else {
@@ -172,7 +187,7 @@ private enum BackgroundPaste {
         let subrole = stringAttribute(kAXSubroleAttribute as CFString, from: element)
         let title = stringAttribute(kAXTitleAttribute as CFString, from: element)
         let selectedRange = selectedTextRange(from: element)
-        let cmuxTarget = app?.bundleIdentifier == "com.cmuxterm.app" ? captureCmuxTarget(app: app) : nil
+        let cmuxTarget = resolveCmuxTarget && app?.bundleIdentifier == "com.cmuxterm.app" ? captureCmuxTarget(app: app) : nil
         let summaryParts = [
             app?.localizedName,
             app?.bundleIdentifier,
@@ -193,6 +208,16 @@ private enum BackgroundPaste {
             cmuxTarget: cmuxTarget,
             summary: summary.isEmpty ? "pid=\(pid)" : summary
         )
+    }
+
+    static func resolveCmuxTarget(for target: BackgroundPasteTarget) -> BackgroundPasteTarget? {
+        guard target.needsCmuxResolution,
+              let app = NSRunningApplication(processIdentifier: target.pid),
+              app.bundleIdentifier == "com.cmuxterm.app",
+              let cmuxTarget = captureCmuxTarget(app: app) else {
+            return target
+        }
+        return target.withCmuxTarget(cmuxTarget)
     }
 
     static func insert(_ text: String, into target: BackgroundPasteTarget) -> BackgroundPasteResult {
@@ -466,6 +491,9 @@ private enum BackgroundPaste {
             }
 
             log("cmux-\(operation) failed attempt=\(attempt) mode=direct exit=\(result.exitCode) stderr=\(result.stderr) argv=\(sanitizedCmuxArgv(executablePath: executablePath, arguments: arguments, operation: operation))")
+            if isCmuxSocketConnectionFailure(result.stderr) {
+                return nil
+            }
             if let shellResult = runProcess(executablePath: "/bin/zsh", arguments: ["-lc", shellCommand(executablePath: executablePath, arguments: arguments)]) {
                 if shellResult.exitCode == 0 {
                     log("cmux-\(operation) recovered attempt=\(attempt) mode=shell")
@@ -493,6 +521,10 @@ private enum BackgroundPaste {
         }
 
         return nil
+    }
+
+    private static func isCmuxSocketConnectionFailure(_ stderr: String) -> Bool {
+        stderr.contains("Failed to connect to socket") || stderr.contains("Connection refused")
     }
 
     private static func shellCommand(executablePath: String, arguments: [String]) -> String {
@@ -736,6 +768,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var activeRecordingStartedByHeadsetHold = false
     private var activeRecordingSource = ""
     private var activeRecordingPasteTarget: BackgroundPasteTarget?
+    private var activeRecordingPasteTargetResolutionTask: Task<BackgroundPasteTarget?, Never>?
+    private var activeRecordingPasteTargetGeneration = 0
     private var airPodsMuteStateObserver: NSObjectProtocol?
     private var lastAirPodsMuteToggleAt: Date?
     private var airPodsLastVoiceAt: Date?
@@ -1619,7 +1653,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         startedByHeadsetHold: Bool = false,
         source: String
     ) {
-        let pasteTarget = state.backgroundPasteEnabled ? BackgroundPaste.captureIfTrusted() : nil
+        let pasteTarget = state.backgroundPasteEnabled ? BackgroundPaste.captureIfTrusted(resolveCmuxTarget: false) : nil
 
         if kind == .hold {
             holdRecordingStartPending = true
@@ -1665,6 +1699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 activeRecordingStartedByHeadsetHold = startedByHeadsetHold
                 activeRecordingSource = source
                 activeRecordingPasteTarget = pasteTarget
+                startPasteTargetResolutionIfNeeded(for: pasteTarget)
                 airPodsLastVoiceAt = startedByAirPods ? Date() : nil
                 airPodsPeakRMS = 0
                 airPodsLastLevelLogAt = nil
@@ -1684,6 +1719,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } catch {
                 clearPendingHoldStartIfNeeded(kind: kind)
                 activeRecordingPasteTarget = nil
+                activeRecordingPasteTargetResolutionTask?.cancel()
+                activeRecordingPasteTargetResolutionTask = nil
                 state.statusText = "Could not start recording: \(error.localizedDescription)"
                 Self.appendTranscriptionDebugLog("start failed source=\(source) kind=\(kind) error=\(error.localizedDescription)")
                 if hasPendingTranscriptions {
@@ -1692,6 +1729,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     state.transcriptionStage = .error(error.localizedDescription)
                     state.isBusy = false
                 }
+            }
+        }
+    }
+
+    @MainActor
+    private func startPasteTargetResolutionIfNeeded(for pasteTarget: BackgroundPasteTarget?) {
+        activeRecordingPasteTargetResolutionTask?.cancel()
+        activeRecordingPasteTargetResolutionTask = nil
+        activeRecordingPasteTargetGeneration &+= 1
+
+        guard let pasteTarget, pasteTarget.needsCmuxResolution else {
+            return
+        }
+
+        let generation = activeRecordingPasteTargetGeneration
+        let startedAt = Date()
+        let task = Task.detached(priority: .userInitiated) {
+            BackgroundPaste.resolveCmuxTarget(for: pasteTarget)
+        }
+        activeRecordingPasteTargetResolutionTask = task
+
+        Task { @MainActor [weak self, task] in
+            guard let self, let resolved = await task.value else { return }
+            guard self.activeRecordingPasteTargetGeneration == generation,
+                  self.activeRecordingPasteTarget?.pid == pasteTarget.pid else {
+                return
+            }
+            self.activeRecordingPasteTarget = resolved
+            let elapsed = Date().timeIntervalSince(startedAt)
+            if resolved.cmuxTarget != nil {
+                Self.appendTranscriptionDebugLog("cmux-identify resolved elapsed=\(String(format: "%.3f", elapsed))")
+            } else {
+                Self.appendTranscriptionDebugLog("cmux-identify unavailable elapsed=\(String(format: "%.3f", elapsed))")
+            }
+        }
+    }
+
+    @MainActor
+    private func resolvedActiveRecordingPasteTarget() async -> BackgroundPasteTarget? {
+        guard let target = activeRecordingPasteTarget,
+              target.needsCmuxResolution,
+              let task = activeRecordingPasteTargetResolutionTask else {
+            return activeRecordingPasteTarget
+        }
+
+        guard let resolved = await waitForPasteTargetResolution(task, timeout: 0.15) else {
+            return activeRecordingPasteTarget ?? target
+        }
+        return resolved
+    }
+
+    @MainActor
+    private func waitForPasteTargetResolution(
+        _ task: Task<BackgroundPasteTarget?, Never>,
+        timeout: TimeInterval
+    ) async -> BackgroundPasteTarget? {
+        await withCheckedContinuation { continuation in
+            var didResume = false
+            func resume(_ value: BackgroundPasteTarget?) {
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume(returning: value)
+            }
+
+            Task { @MainActor in
+                resume(await task.value)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                resume(nil)
             }
         }
     }
@@ -1715,7 +1821,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let wasStartedByHeadsetHold = activeRecordingStartedByHeadsetHold
             let stoppedRecordingKind = activeRecordingKind
             let stoppedRecordingSource = activeRecordingSource
-            let pasteTarget = activeRecordingPasteTarget
+            let pasteTarget = await resolvedActiveRecordingPasteTarget()
             stopRecordingStatusTimer()
             activeRecordingKind = nil
             activeRecordingShouldPressReturn = false
@@ -1723,6 +1829,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             activeRecordingStartedByHeadsetHold = false
             activeRecordingSource = ""
             activeRecordingPasteTarget = nil
+            activeRecordingPasteTargetResolutionTask?.cancel()
+            activeRecordingPasteTargetResolutionTask = nil
             airPodsLastVoiceAt = nil
             airPodsPeakRMS = 0
             airPodsLastLevelLogAt = nil
